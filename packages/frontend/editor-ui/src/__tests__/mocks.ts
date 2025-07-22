@@ -96,6 +96,7 @@ export const mockNodeTypeDescription = ({
 		documentationUrl: 'https://docs',
 		iconUrl: 'nodes/test-node/icon.svg',
 		webhooks: undefined,
+		parameterPane: undefined,
 		hidden,
 	});
 
@@ -220,6 +221,8 @@ export function createMockEnterpriseSettings(
 		sharing: false,
 		ldap: false,
 		saml: false,
+		oidc: false,
+		mfaEnforcement: false,
 		logStreaming: false,
 		advancedExecutionFilters: false,
 		variables: false,

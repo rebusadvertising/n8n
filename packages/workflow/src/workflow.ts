@@ -1,12 +1,14 @@
-/* eslint-disable @typescript-eslint/no-use-before-define */
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
 /* eslint-disable @typescript-eslint/no-unsafe-return */
 /* eslint-disable @typescript-eslint/no-for-in-array */
 import {
 	MANUAL_CHAT_TRIGGER_LANGCHAIN_NODE_TYPE,
 	NODES_WITH_RENAMABLE_CONTENT,
+	NODES_WITH_RENAMABLE_FORM_HTML_CONTENT,
+	NODES_WITH_RENAMEABLE_TOPLEVEL_HTML_CONTENT,
 	STARTING_NODE_TYPES,
 } from './constants';
+import { UserError } from './errors';
 import { ApplicationError } from './errors/application.error';
 import { Expression } from './expression';
 import { getGlobalState } from './global-state';
@@ -31,6 +33,7 @@ import type {
 } from './interfaces';
 import { NodeConnectionTypes } from './interfaces';
 import * as NodeHelpers from './node-helpers';
+import { renameFormFields } from './node-parameters/rename-node-utils';
 import { applyAccessPatterns } from './node-reference-parser-utils';
 import * as ObservableObject from './observable-object';
 
@@ -379,6 +382,29 @@ export class Workflow {
 	 * @param {string} newName The new name
 	 */
 	renameNode(currentName: string, newName: string) {
+		// These keys are excluded to prevent accidental modification of inherited properties and
+		// to avoid any issues related to JavaScript's built-in methods that can cause unexpected behavior
+		const restrictedKeys = [
+			'hasOwnProperty',
+			'isPrototypeOf',
+			'propertyIsEnumerable',
+			'toLocaleString',
+			'toString',
+			'valueOf',
+			'constructor',
+			'prototype',
+			'__proto__',
+			'__defineGetter__',
+			'__defineSetter__',
+			'__lookupGetter__',
+			'__lookupSetter__',
+		];
+
+		if (restrictedKeys.map((k) => k.toLowerCase()).includes(newName.toLowerCase())) {
+			throw new UserError(`Node name "${newName}" is a restricted name.`, {
+				description: `Node names cannot be any of the following: ${restrictedKeys.join(', ')}`,
+			});
+		}
 		// Rename the node itself
 		if (this.nodes[currentName] !== undefined) {
 			this.nodes[newName] = this.nodes[currentName];
@@ -401,6 +427,21 @@ export class Workflow {
 					currentName,
 					newName,
 					{ hasRenamableContent: true },
+				);
+			}
+			if (NODES_WITH_RENAMEABLE_TOPLEVEL_HTML_CONTENT.has(node.type)) {
+				node.parameters.html = this.renameNodeInParameterValue(
+					node.parameters.html,
+					currentName,
+					newName,
+					{ hasRenamableContent: true },
+				);
+			}
+			if (NODES_WITH_RENAMABLE_FORM_HTML_CONTENT.has(node.type)) {
+				renameFormFields(node, (p) =>
+					this.renameNodeInParameterValue(p, currentName, newName, {
+						hasRenamableContent: true,
+					}),
 				);
 			}
 		}
@@ -492,7 +533,7 @@ export class Workflow {
 			}
 			connectionsByIndex =
 				this.connectionsByDestinationNode[nodeName][NodeConnectionTypes.Main][connectionIndex];
-			// eslint-disable-next-line @typescript-eslint/no-loop-func
+
 			connectionsByIndex?.forEach((connection) => {
 				if (checkedNodes.includes(connection.node)) {
 					// Node got checked already before
@@ -688,7 +729,6 @@ export class Workflow {
 			const toAdd = [...queue];
 			queue = [];
 
-			// eslint-disable-next-line @typescript-eslint/no-loop-func
 			toAdd.forEach((curr) => {
 				if (visited[curr.name]) {
 					visited[curr.name].indicies = dedupe(visited[curr.name].indicies.concat(curr.indicies));
@@ -728,7 +768,7 @@ export class Workflow {
 			const outputs = NodeHelpers.getNodeOutputs(this, node, nodeType.description);
 
 			if (
-				!!outputs.find(
+				outputs.find(
 					(output) =>
 						((output as INodeOutputConfiguration)?.type ?? output) !== NodeConnectionTypes.Main,
 				)
@@ -860,13 +900,16 @@ export class Workflow {
 		// Check if there are any trigger or poll nodes and then return the first one
 		let node: INode;
 		let nodeType: INodeType;
-		for (const nodeName of nodeNames) {
-			node = this.nodes[nodeName];
 
-			if (nodeNames.length === 1 && !node.disabled) {
+		if (nodeNames.length === 1) {
+			node = this.nodes[nodeNames[0]];
+			if (node && !node.disabled) {
 				return node;
 			}
+		}
 
+		for (const nodeName of nodeNames) {
+			node = this.nodes[nodeName];
 			nodeType = this.nodeTypes.getByNameAndVersion(node.type, node.typeVersion);
 
 			// TODO: Identify later differently
@@ -960,5 +1003,63 @@ export class Workflow {
 		}
 
 		return result;
+	}
+
+	/**
+	 * Checks if there's a bidirectional path between two nodes.
+	 * This handles AI/tool nodes that have complex connection patterns
+	 * where simple parent-child traversal doesn't work.
+	 *
+	 * @param fromNodeName The starting node name
+	 * @param toNodeName The target node name
+	 * @param maxDepth Maximum depth to search (default: 50)
+	 * @returns true if there's a path between the nodes
+	 */
+	hasPath(fromNodeName: string, toNodeName: string, maxDepth = 50): boolean {
+		if (fromNodeName === toNodeName) return true;
+
+		const visited = new Set<string>();
+		const queue: Array<{ nodeName: string; depth: number }> = [
+			{ nodeName: fromNodeName, depth: 0 },
+		];
+
+		while (queue.length > 0) {
+			const { nodeName, depth } = queue.shift()!;
+
+			if (depth > maxDepth) continue;
+			if (visited.has(nodeName)) continue;
+			if (nodeName === toNodeName) return true;
+
+			visited.add(nodeName);
+
+			// Check all connection types for this node
+			const allConnectionTypes = [
+				NodeConnectionTypes.Main,
+				NodeConnectionTypes.AiTool,
+				NodeConnectionTypes.AiMemory,
+				NodeConnectionTypes.AiDocument,
+				NodeConnectionTypes.AiVectorStore,
+			];
+
+			for (const connectionType of allConnectionTypes) {
+				// Get children (forward direction)
+				const children = this.getChildNodes(nodeName, connectionType);
+				for (const childName of children) {
+					if (!visited.has(childName)) {
+						queue.push({ nodeName: childName, depth: depth + 1 });
+					}
+				}
+
+				// Get parents (backward direction)
+				const parents = this.getParentNodes(nodeName, connectionType);
+				for (const parentName of parents) {
+					if (!visited.has(parentName)) {
+						queue.push({ nodeName: parentName, depth: depth + 1 });
+					}
+				}
+			}
+		}
+
+		return false;
 	}
 }

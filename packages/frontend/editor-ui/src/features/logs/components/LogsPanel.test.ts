@@ -11,6 +11,7 @@ import {
 	aiAgentNode,
 	aiChatExecutionResponse,
 	aiChatWorkflow,
+	aiManualExecutionResponse,
 	aiManualWorkflow,
 	chatTriggerNode,
 	nodeTypes,
@@ -107,6 +108,8 @@ describe('LogsPanel', () => {
 			y: 0,
 			height: VIEWPORT_HEIGHT,
 		} as DOMRect);
+
+		localStorage.clear();
 	});
 
 	afterEach(() => {
@@ -136,6 +139,30 @@ describe('LogsPanel', () => {
 
 		expect(await rendered.findByTestId('logs-overview-header')).toBeInTheDocument();
 		expect(await rendered.findByTestId('chat-header')).toBeInTheDocument();
+	});
+
+	it('should render only output panel of selected node by default', async () => {
+		logsStore.toggleOpen(true);
+		workflowsStore.setWorkflow(aiManualWorkflow);
+		workflowsStore.setWorkflowExecutionData(aiManualExecutionResponse);
+
+		const rendered = render();
+
+		expect(rendered.queryByTestId('log-details-header')).toHaveTextContent('AI Agent');
+		expect(rendered.queryByTestId('log-details-input')).not.toBeInTheDocument();
+		expect(rendered.queryByTestId('log-details-output')).toBeInTheDocument();
+	});
+
+	it('should render both input and output panel of selected node by default if it is sub node', async () => {
+		logsStore.toggleOpen(true);
+		workflowsStore.setWorkflow(aiChatWorkflow);
+		workflowsStore.setWorkflowExecutionData(aiChatExecutionResponse);
+
+		const rendered = render();
+
+		expect(rendered.queryByTestId('log-details-header')).toHaveTextContent('AI Model');
+		expect(rendered.queryByTestId('log-details-input')).toBeInTheDocument();
+		expect(rendered.queryByTestId('log-details-output')).toBeInTheDocument();
 	});
 
 	it('opens collapsed panel when clicked', async () => {
@@ -295,7 +322,8 @@ describe('LogsPanel', () => {
 			},
 		});
 		expect(await lastTreeItem.findByText('AI Agent')).toBeInTheDocument();
-		expect(lastTreeItem.getByText('Success in 33ms')).toBeInTheDocument();
+		expect(await lastTreeItem.findByText('Success')).toBeInTheDocument();
+		expect(lastTreeItem.getByText('in 33ms')).toBeInTheDocument();
 
 		workflowsStore.setWorkflowExecutionData({
 			...workflowsStore.workflowExecutionData!,
@@ -384,8 +412,6 @@ describe('LogsPanel', () => {
 
 	it('should toggle input and output panel when the button is clicked', async () => {
 		logsStore.toggleOpen(true);
-		logsStore.toggleInputOpen(false);
-		logsStore.toggleOutputOpen(true);
 		workflowsStore.setWorkflow(aiChatWorkflow);
 		workflowsStore.setWorkflowExecutionData(aiChatExecutionResponse);
 
@@ -393,18 +419,46 @@ describe('LogsPanel', () => {
 
 		const header = within(rendered.getByTestId('log-details-header'));
 
-		expect(rendered.queryByTestId('log-details-input')).not.toBeInTheDocument();
+		expect(rendered.queryByTestId('log-details-input')).toBeInTheDocument();
 		expect(rendered.queryByTestId('log-details-output')).toBeInTheDocument();
 
 		await fireEvent.click(header.getByText('Input'));
 
-		expect(rendered.queryByTestId('log-details-input')).toBeInTheDocument();
+		expect(rendered.queryByTestId('log-details-input')).not.toBeInTheDocument();
 		expect(rendered.queryByTestId('log-details-output')).toBeInTheDocument();
 
 		await fireEvent.click(header.getByText('Output'));
 
 		expect(rendered.queryByTestId('log-details-input')).toBeInTheDocument();
 		expect(rendered.queryByTestId('log-details-output')).not.toBeInTheDocument();
+	});
+
+	it('should show new name when a node is renamed', async () => {
+		const canvasOperations = useCanvasOperations();
+
+		logsStore.toggleOpen(true);
+
+		// Create deep copy so that renaming doesn't affect other test cases
+		workflowsStore.setWorkflow(deepCopy(aiChatWorkflow));
+		workflowsStore.setWorkflowExecutionData(deepCopy(aiChatExecutionResponse));
+
+		const rendered = render();
+
+		await nextTick();
+
+		expect(
+			within(rendered.getByTestId('log-details-header')).getByText('AI Model'),
+		).toBeInTheDocument();
+		expect(within(rendered.getByRole('tree')).getByText('AI Model')).toBeInTheDocument();
+
+		await canvasOperations.renameNode('AI Model', 'Renamed!!');
+
+		await waitFor(() => {
+			expect(
+				within(rendered.getByTestId('log-details-header')).getByText('Renamed!!'),
+			).toBeInTheDocument();
+			expect(within(rendered.getByRole('tree')).getByText('Renamed!!')).toBeInTheDocument();
+		});
 	});
 
 	describe('selection', () => {
@@ -460,6 +514,25 @@ describe('LogsPanel', () => {
 			uiStore.lastSelectedNode = 'AI Model';
 			await rerender({});
 			expect(await findByRole('treeitem', { selected: true })).toHaveTextContent(/AI Model/);
+		});
+
+		it("should automatically select a log for the selected node on canvas even after it's renamed", async () => {
+			const canvasOperations = useCanvasOperations();
+
+			workflowsStore.setWorkflow(deepCopy(aiChatWorkflow));
+			workflowsStore.setWorkflowExecutionData(deepCopy(aiChatExecutionResponse));
+
+			logsStore.toggleLogSelectionSync(true);
+
+			const { rerender, findByRole } = render();
+
+			expect(await findByRole('treeitem', { selected: true })).toHaveTextContent(/AI Model/);
+
+			await canvasOperations.renameNode('AI Agent', 'Renamed Agent');
+			uiStore.lastSelectedNode = 'Renamed Agent';
+
+			await rerender({});
+			expect(await findByRole('treeitem', { selected: true })).toHaveTextContent(/Renamed Agent/);
 		});
 	});
 

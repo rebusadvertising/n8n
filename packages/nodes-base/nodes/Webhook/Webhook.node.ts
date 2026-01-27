@@ -1,6 +1,6 @@
 /* eslint-disable n8n-nodes-base/node-execute-block-wrong-error-thrown */
 import { createWriteStream } from 'fs';
-import { stat } from 'fs/promises';
+import { rm, stat } from 'fs/promises';
 import isbot from 'isbot';
 import type {
 	IWebhookFunctions,
@@ -12,6 +12,7 @@ import type {
 	INodeProperties,
 } from 'n8n-workflow';
 import { BINARY_ENCODING, NodeOperationError, Node } from 'n8n-workflow';
+import * as a from 'node:assert';
 import { pipeline } from 'stream/promises';
 import { file as tmpFile } from 'tmp-promise';
 import { v4 as uuid } from 'uuid';
@@ -47,8 +48,7 @@ export class Webhook extends Node {
 		name: 'webhook',
 		group: ['trigger'],
 		version: [1, 1.1, 2, 2.1],
-		// Keep the default version as 2 to avoid releasing streaming in broken state
-		defaultVersion: 2,
+		defaultVersion: 2.1,
 		description: 'Starts the workflow when a webhook is called',
 		eventTriggerDescription: 'Waiting for you to call the Test URL',
 		activationMessage: 'You can now make calls to your production webhook URL.',
@@ -176,6 +176,18 @@ export class Webhook extends Node {
 			},
 			responseDataProperty,
 			responseBinaryPropertyNameProperty,
+			{
+				displayName:
+					'If you are sending back a response, add a "Content-Type" response header with the appropriate value to avoid unexpected behavior',
+				name: 'contentTypeNotice',
+				type: 'notice',
+				default: '',
+				displayOptions: {
+					show: {
+						responseMode: ['onReceived'],
+					},
+				},
+			},
 
 			{
 				...optionsProperty,
@@ -305,6 +317,7 @@ export class Webhook extends Node {
 		prepareOutput: (data: INodeExecutionData) => INodeExecutionData[][],
 	) {
 		const req = context.getRequestObject() as MultiPartFormData.Request;
+		a.ok(req.contentType === 'multipart/form-data', 'Expected multipart/form-data');
 		const options = context.getNodeParameter('options', {}) as IDataObject;
 		const { data, files } = req.body;
 
@@ -351,6 +364,9 @@ export class Webhook extends Node {
 					file.originalFilename ?? file.newFilename,
 					file.mimetype,
 				);
+
+				// Delete original file to prevent tmp directory from growing too large
+				await rm(file.filepath, { force: true });
 
 				count += 1;
 			}

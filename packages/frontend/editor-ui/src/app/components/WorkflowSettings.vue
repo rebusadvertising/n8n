@@ -31,6 +31,7 @@ import { useSettingsStore } from '@/app/stores/settings.store';
 import { useRootStore } from '@n8n/stores/useRootStore';
 import { useWorkflowsEEStore } from '@/app/stores/workflows.ee.store';
 import { useWorkflowsStore } from '@/app/stores/workflows.store';
+import { useWorkflowsListStore } from '@/app/stores/workflowsList.store';
 import { createEventBus } from '@n8n/utils/event-bus';
 import { useExternalHooks } from '@/app/composables/useExternalHooks';
 import { useSourceControlStore } from '@/features/integrations/sourceControl.ee/sourceControl.store';
@@ -41,11 +42,12 @@ import { useI18n } from '@n8n/i18n';
 import { useTelemetry } from '@/app/composables/useTelemetry';
 import { useDebounce } from '@/app/composables/useDebounce';
 import { injectWorkflowState } from '@/app/composables/useWorkflowState';
+import { injectWorkflowDocumentStore } from '@/app/stores/workflowDocument.store';
 import { useMcp } from '@/features/ai/mcpAccess/composables/useMcp';
 import { useGlobalLinkActions } from '@/app/composables/useGlobalLinkActions';
 import { useNodeCreatorStore } from '@/features/shared/nodeCreator/nodeCreator.store';
-import { useEnvFeatureFlag } from '@/features/shared/envFeatureFlag/useEnvFeatureFlag';
 import { useCredentialResolvers } from '@/features/resolvers/composables/useCredentialResolvers';
+import { useDynamicCredentials } from '@/features/resolvers/composables/useDynamicCredentials';
 
 import { ElCol, ElRow, ElSwitch } from 'element-plus';
 
@@ -57,14 +59,16 @@ const modalBus = createEventBus();
 const telemetry = useTelemetry();
 const { isEligibleForMcpAccess, trackMcpAccessEnabledForWorkflow, mcpTriggerMap } = useMcp();
 const { registerCustomAction, unregisterCustomAction } = useGlobalLinkActions();
-const { check: checkEnvFeatureFlag } = useEnvFeatureFlag();
+const { isEnabled: isCredentialResolverEnabled } = useDynamicCredentials();
 
 const rootStore = useRootStore();
 const settingsStore = useSettingsStore();
 const sourceControlStore = useSourceControlStore();
 const collaborationStore = useCollaborationStore();
 const workflowsStore = useWorkflowsStore();
+const workflowsListStore = useWorkflowsListStore();
 const workflowState = injectWorkflowState();
+const workflowDocumentStore = injectWorkflowDocumentStore();
 const workflowsEEStore = useWorkflowsEEStore();
 const nodeCreatorStore = useNodeCreatorStore();
 const posthogStore = usePostHog();
@@ -142,15 +146,12 @@ const executionLogic = computed(() => {
 const isMCPEnabled = computed(
 	() => settingsStore.isModuleActive('mcp') && settingsStore.moduleSettings.mcp?.mcpAccessEnabled,
 );
-const isCredentialResolverEnabled = computed(() =>
-	checkEnvFeatureFlag.value('DYNAMIC_CREDENTIALS'),
-);
 const readOnlyEnv = computed(
 	() => sourceControlStore.preferences.branchReadOnly || collaborationStore.shouldBeReadOnly,
 );
 const workflowName = computed(() => workflowsStore.workflowName);
 const workflowId = computed(() => workflowsStore.workflowId);
-const workflow = computed(() => workflowsStore.getWorkflowById(workflowId.value));
+const workflow = computed(() => workflowsListStore.getWorkflowById(workflowId.value));
 const isSharingEnabled = computed(
 	() => settingsStore.isEnterpriseFeatureEnabled[EnterpriseEditionFeature.Sharing],
 );
@@ -194,11 +195,11 @@ const hasSavedTimeNodes = computed(() => {
 
 const timeSavedModeOptions = computed(() => [
 	{
-		label: 'Fixed',
+		label: i18n.baseText('workflowSettings.timeSavedPerExecution.tab.fixed'),
 		value: 'fixed' as const,
 	},
 	{
-		label: 'Dynamic (uses time saved nodes)',
+		label: i18n.baseText('workflowSettings.timeSavedPerExecution.tab.dynamic'),
 		value: 'dynamic' as const,
 	},
 ]);
@@ -394,7 +395,7 @@ const loadTimezones = async () => {
 };
 
 const loadWorkflows = async (searchTerm?: string) => {
-	const workflowsData = (await workflowsStore.searchWorkflows({
+	const workflowsData = (await workflowsListStore.searchWorkflows({
 		query: searchTerm,
 		isArchived: false,
 		triggerNodeTypes: ['n8n-nodes-base.errorTrigger'],
@@ -502,7 +503,7 @@ const saveSettings = async () => {
 
 	isLoading.value = true;
 	data.versionId = workflowsStore.workflowVersionId;
-	data.expectedChecksum = workflowsStore.workflowChecksum;
+	data.expectedChecksum = workflowDocumentStore?.value?.checksum;
 
 	try {
 		await workflowsStore.updateWorkflow(String(route.params.name), data);
@@ -618,7 +619,7 @@ onMounted(async () => {
 
 	try {
 		const promises = [
-			workflowsStore.fetchWorkflow(workflowId.value),
+			workflowsListStore.fetchWorkflow(workflowId.value),
 			loadWorkflows(),
 			loadSaveDataErrorExecutionOptions(),
 			loadSaveDataSuccessExecutionOptions(),
@@ -851,9 +852,8 @@ onBeforeUnmount(() => {
 							</N8nSelect>
 							<N8nIconButton
 								v-if="workflowSettings.credentialResolverId"
+								variant="ghost"
 								icon="pen"
-								type="tertiary"
-								:text="true"
 								size="small"
 								:disabled="readOnlyEnv || !workflowPermissions.update"
 								:title="i18n.baseText('workflowSettings.credentialResolver.edit')"

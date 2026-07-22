@@ -14,11 +14,15 @@ export { loadWorkflowTestCasesWithFiles } from './data/workflows';
 export type { WorkflowTestCaseWithFile } from './data/workflows';
 
 // -- Credentials --
-export { seedCredentials, cleanupCredentials } from './credentials/seeder';
-export type { SeedResult } from './credentials/seeder';
+export { createDeclaredCredentials, cleanupCredentials } from './credentials/seeder';
+export type { CreatedCredential } from './credentials/seeder';
 
-// -- Runner (all-in-one) --
-export { runWorkflowTestCase, runWithConcurrency } from './harness/runner';
+// -- MCP Registry --
+export { seedMcpRegistry } from './mcp-registry/seeder';
+export type { McpRegistrySeedResult } from './mcp-registry/seeder';
+
+// -- Concurrency helper --
+export { runWithConcurrency } from './harness/runner';
 
 // -- Runner (split API: build once, run scenarios independently) --
 export { buildWorkflow, executeScenario, cleanupBuild } from './harness/runner';
@@ -48,15 +52,21 @@ export {
 	hardRegressions,
 	softRegressions,
 	watchList,
+	scenarioUnitKey,
+	expectationUnitKey,
+	unitKeyOf,
 } from './comparison/compare';
 export type {
 	ComparisonResult,
-	ScenarioComparison,
-	ScenarioCounts,
+	EvaluationUnitComparison,
+	EvaluationUnitCounts,
+	EvaluationUnitKind,
+	UnitRef,
 	ExperimentBucket,
 	AggregateComparison,
 	FailureCategoryComparison,
 } from './comparison/compare';
+export { bucketFromEvaluation } from './comparison/bucket-from-evaluation';
 export {
 	classifyScenario,
 	fishersExactOneSidedLeft,

@@ -8,6 +8,7 @@ export const MODULE_NAMES = [
 	'external-secrets',
 	'community-packages',
 	'data-table',
+	'oauth-server',
 	'mcp',
 	'provisioning',
 	'breaking-changes',
@@ -32,6 +33,7 @@ export const MODULE_NAMES = [
 	'oauth-jwe',
 	'runtime-credentials',
 	'n8n-packages',
+	'workflow-reviews',
 ] as const;
 
 export type ModuleName = (typeof MODULE_NAMES)[number];

@@ -119,7 +119,33 @@ export class Snowflake implements INodeType {
 				default: '',
 				placeholder: 'SELECT id, name FROM product WHERE id < 40',
 				required: true,
-				description: 'The SQL query to execute',
+				description:
+					"The SQL query to execute. Use ? (bound in order) or :1, :2, :3 to refer to the 'Query Parameters' set in the options below.",
+				hint: 'Consider using query parameters to prevent SQL injection attacks. Add them in the options below',
+			},
+			{
+				displayName: 'Options',
+				name: 'options',
+				type: 'collection',
+				displayOptions: {
+					show: {
+						operation: ['executeQuery'],
+					},
+				},
+				default: {},
+				placeholder: 'Add option',
+				options: [
+					{
+						displayName: 'Query Parameters',
+						name: 'queryReplacement',
+						type: 'string',
+						default: '',
+						placeholder: 'e.g. value1,value2,value3',
+						description:
+							'Comma-separated list of the values you want to use as query parameters. You can drag the values from the input panel on the left.',
+						hint: 'Comma-separated list of values: reference them in your query as ? (in order) or :1, :2, :3…',
+					},
+				],
 			},
 
 			// ----------------------------------
@@ -203,9 +229,13 @@ export class Snowflake implements INodeType {
 
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 		// Disable logging - https://docs.snowflake.com/en/developer-guide/node-js/nodejs-driver-logs#configure-the-default-logging-behavior
+		// Parse VARIANT/OBJECT/ARRAY columns with JSON.parse. The SDK keeps its XML
+		// fallback for non-JSON values, and STRICT_JSON_OUTPUT (set on the session
+		// below) renders non-finite numbers as null so the output is always valid JSON.
 		snowflake.configure({
 			logFilePath: 'STDOUT',
 			logLevel: 'OFF',
+			jsonColumnVariantParser: JSON.parse,
 		});
 
 		const authMethod = this.getNodeParameter('authentication', 0, 'credentials') as string;
@@ -238,6 +268,10 @@ export class Snowflake implements INodeType {
 
 		await connect(connection);
 
+		// Render non-finite numbers (NaN, Infinity) in VARIANT/OBJECT/ARRAY columns as
+		// null so the column output is always valid JSON for the parser above.
+		await execute(connection, 'ALTER SESSION SET STRICT_JSON_OUTPUT = TRUE', []);
+
 		let returnData: INodeExecutionData[] = [];
 		const items = this.getInputData();
 		const operation = this.getNodeParameter('operation', 0);
@@ -254,7 +288,25 @@ export class Snowflake implements INodeType {
 					query = query.replace(resolvable, this.evaluateExpression(resolvable, i) as string);
 				}
 
-				const responseData = await execute(connection, query, []);
+				const options = this.getNodeParameter('options', i, {}) as IDataObject;
+				const rawReplacement = options.queryReplacement;
+				let binds: snowflake.Bind[] = [];
+
+				if (rawReplacement !== undefined && rawReplacement !== '') {
+					if (typeof rawReplacement === 'string') {
+						binds = rawReplacement.split(',').map((entry) => entry.trim());
+					} else if (Array.isArray(rawReplacement)) {
+						binds = rawReplacement as snowflake.Bind[];
+					} else {
+						throw new NodeOperationError(
+							this.getNode(),
+							'Query Parameters must be a string of comma-separated values, or an array of values',
+							{ itemIndex: i },
+						);
+					}
+				}
+
+				const responseData = await execute(connection, query, binds);
 				const executionData = this.helpers.constructExecutionMetaData(
 					this.helpers.returnJsonArray(responseData as IDataObject[]),
 					{ itemData: { item: i } },
@@ -276,7 +328,7 @@ export class Snowflake implements INodeType {
 			const query = `INSERT INTO ${quotedTable} (${quotedColumns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`;
 			const data = this.helpers.copyInputItems(items, columns);
 			const binds = data.map((element) => [...Object.values(element)]);
-			await execute(connection, query, binds as unknown as snowflake.InsertBinds);
+			await execute(connection, query, binds as snowflake.Binds);
 			data.forEach((d, i) => {
 				const executionData = this.helpers.constructExecutionMetaData(
 					this.helpers.returnJsonArray(d),
@@ -315,7 +367,7 @@ export class Snowflake implements INodeType {
 				return rowBinds;
 			});
 			for (let i = 0; i < binds.length; i++) {
-				await execute(connection, query, binds[i] as unknown as snowflake.InsertBinds);
+				await execute(connection, query, binds[i] as snowflake.Binds);
 			}
 			data.forEach((d, i) => {
 				const executionData = this.helpers.constructExecutionMetaData(

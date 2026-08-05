@@ -431,10 +431,6 @@ export const getWorkspaceRoot: typeof SharedSandboxMod.getWorkspaceRoot = lazyFu
 export const getPromptWorkspaceRoot: typeof SharedSandboxMod.getPromptWorkspaceRoot = lazyFunction(
 	() => loadSharedSandbox().getPromptWorkspaceRoot,
 );
-export const getPromptSandboxInstructions: typeof SharedSandboxMod.getPromptSandboxInstructions =
-	lazyFunction(() => loadSharedSandbox().getPromptSandboxInstructions);
-export const getPromptFilesystemInstructions: typeof SharedSandboxMod.getPromptFilesystemInstructions =
-	lazyFunction(() => loadSharedSandbox().getPromptFilesystemInstructions);
 export const setupSandboxWorkspace: typeof SandboxSetupMod.setupSandboxWorkspace = lazyFunction(
 	() => loadSandboxSetup().setupSandboxWorkspace,
 );
@@ -596,6 +592,8 @@ export type {
 	DataTableColumnInfo,
 	DataTableFilterInput,
 	InstanceAiEvaluationConfigService,
+	InstanceAiMcpService,
+	McpRegistryServerSummary,
 	EvaluationConfigSummary,
 	EvaluationConfigDetail,
 	EvaluationConfigMetricInput,

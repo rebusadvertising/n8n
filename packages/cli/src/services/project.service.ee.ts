@@ -1,6 +1,5 @@
 import type { CreateProjectDto, ProjectType, UpdateProjectDto } from '@n8n/api-types';
 import { LicenseState, Logger, ModuleRegistry } from '@n8n/backend-common';
-import { UNLIMITED_LICENSE_QUOTA } from '@n8n/constants';
 import {
 	type User,
 	FolderRepository,
@@ -8,6 +7,7 @@ import {
 	ProjectRelation,
 	ProjectRelationRepository,
 	ProjectRepository,
+	ProjectIdConflictError,
 	SharedCredentialsRepository,
 	SharedWorkflowRepository,
 	type ProjectListOptions,
@@ -18,6 +18,8 @@ import {
 	getAuthPrincipalScopes,
 	hasGlobalScope,
 	type Scope,
+	type GlobalRole,
+	type ProjectRole,
 	AssignableProjectRole,
 	PROJECT_OWNER_ROLE_SLUG,
 	PROJECT_ADMIN_ROLE_SLUG,
@@ -28,8 +30,11 @@ import { In } from '@n8n/typeorm';
 import { UserError } from 'n8n-workflow';
 
 import { BadRequestError } from '@/errors/response-errors/bad-request.error';
+import { ConflictError } from '@/errors/response-errors/conflict.error';
 import { ForbiddenError } from '@/errors/response-errors/forbidden.error';
 import { NotFoundError } from '@/errors/response-errors/not-found.error';
+import { EventService } from '@/events/event.service';
+import { UserManagementMailer } from '@/user-management/email';
 
 import { OwnershipService } from './ownership.service';
 import { RoleService } from './role.service';
@@ -48,8 +53,8 @@ export class UnlicensedProjectRoleError extends UserError {
 	}
 }
 
-class ProjectNotFoundError extends NotFoundError {
-	constructor(projectId: string) {
+export class ProjectNotFoundError extends NotFoundError {
+	constructor(readonly projectId: string) {
 		super(`Could not find project with ID: ${projectId}`);
 	}
 
@@ -69,6 +74,11 @@ export interface ProjectCreateOverrides {
 	customTelemetryTags?: Array<{ key: string; value: string }>;
 }
 
+export type ProjectWithRelationsAndScopes = Project & {
+	role: ProjectRole | AssignableProjectRole | GlobalRole;
+	scopes?: Scope[];
+};
+
 @Service()
 export class ProjectService {
 	constructor(
@@ -82,6 +92,8 @@ export class ProjectService {
 		private readonly moduleRegistry: ModuleRegistry,
 		private readonly ownershipService: OwnershipService,
 		private readonly logger: Logger,
+		private readonly eventService: EventService,
+		private readonly userManagementMailer: UserManagementMailer,
 	) {}
 
 	private get workflowService() {
@@ -177,6 +189,24 @@ export class ProjectService {
 			);
 		}
 
+		const ownedCredentials = await this.sharedCredentialsRepository.find({
+			where: { projectId: project.id, role: 'credential:owner' },
+			relations: { credentials: true },
+		});
+
+		// End-user credentials can't live in personal projects, so reject the whole
+		// migration before anything moves — deleteProject is a sequence of awaits,
+		// not a transaction.
+		if (targetProject?.type === 'personal') {
+			const endUserCredentials = ownedCredentials.filter((sc) => sc.credentials.isResolvable);
+			if (endUserCredentials.length > 0) {
+				const names = endUserCredentials.map((sc) => `"${sc.credentials.name}"`).join(', ');
+				throw new BadRequestError(
+					`Can't migrate end-user credentials (${names}) to a personal project. Switch them back to fixed credentials, move them to another team project, or delete this project without migrating.`,
+				);
+			}
+		}
+
 		// 1. delete or migrate workflows owned by this project
 		const ownedSharedWorkflows = await this.sharedWorkflowRepository.find({
 			where: { projectId: project.id, role: 'workflow:owner' },
@@ -194,11 +224,6 @@ export class ProjectService {
 		}
 
 		// 2. delete credentials owned by this project
-		const ownedCredentials = await this.sharedCredentialsRepository.find({
-			where: { projectId: project.id, role: 'credential:owner' },
-			relations: { credentials: true },
-		});
-
 		if (targetProject) {
 			await this.sharedCredentialsRepository.makeOwner(
 				ownedCredentials.map((sc) => sc.credentialsId),
@@ -271,7 +296,7 @@ export class ProjectService {
 					});
 				}
 
-				await agentKnowledgeService.destroySandbox(project.id, agent.id);
+				await agentKnowledgeService.destroyKnowledgeSandbox(project.id, agent.id);
 				await agentExecutionService.deleteExecutionLogsForAgent(agent.id);
 			}
 		}
@@ -292,6 +317,14 @@ export class ProjectService {
 			const proxy = await this.connectionStatusProxy;
 			await proxy.cleanupOrphanedEntriesForUsers(memberUserIds);
 		}
+
+		this.eventService.emit('team-project-deleted', {
+			userId: user.id,
+			role: user.role.slug,
+			projectId,
+			removalType: migrateToProject !== undefined ? 'transfer' : 'delete',
+			targetProjectId: migrateToProject,
+		});
 	}
 
 	/**
@@ -351,11 +384,11 @@ export class ProjectService {
 	async getAccessibleProjectsAndCount(
 		user: User,
 		options: ProjectListOptions,
-	): Promise<[Project[], number]> {
-		if (hasGlobalScope(user, 'project:read')) {
-			return await this.projectRepository.findAllProjectsAndCount(options);
-		}
-		return await this.projectRepository.getAccessibleProjectsAndCount(user.id, options);
+	): Promise<{ projects: Project[]; count: number }> {
+		const [projects, count] = hasGlobalScope(user, 'project:read')
+			? await this.projectRepository.findAllProjectsAndCount(options)
+			: await this.projectRepository.getAccessibleProjectsAndCount(user.id, options);
+		return { projects, count };
 	}
 
 	// Returns the projects a caller can pick as share targets, including peer
@@ -365,45 +398,87 @@ export class ProjectService {
 	async getShareableProjectsAndCount(
 		user: User,
 		options: ProjectListOptions,
-	): Promise<[Project[], number]> {
-		if (hasGlobalScope(user, 'project:read')) {
-			return await this.projectRepository.findAllProjectsAndCount(options);
-		}
-		return await this.projectRepository.getShareableProjectsAndCount(user.id, options);
+	): Promise<{ projects: Project[]; count: number }> {
+		const [projects, count] = hasGlobalScope(user, 'project:read')
+			? await this.projectRepository.findAllProjectsAndCount(options)
+			: await this.projectRepository.getShareableProjectsAndCount(user.id, options);
+		return { projects, count };
+	}
+
+	async getProjectsAndCount({
+		offset,
+		limit,
+	}: {
+		offset: number;
+		limit: number;
+	}): Promise<{ projects: Project[]; count: number }> {
+		const [projects, count] = await this.projectRepository.findAndCount({
+			skip: offset,
+			take: limit,
+			order: { createdAt: 'ASC', id: 'ASC' },
+		});
+		return { projects, count };
 	}
 
 	async getPersonalProjectOwners(projectIds: string[]): Promise<ProjectRelation[]> {
 		return await this.projectRelationRepository.getPersonalProjectOwners(projectIds);
 	}
 
-	private async createTeamProjectWithEntityManager(
-		adminUser: User,
-		data: CreateProjectDto,
-		trx: EntityManager,
-		overrides: ProjectCreateOverrides = {},
-	) {
-		const limit = this.licenseState.getMaxTeamProjects();
-		if (limit !== UNLIMITED_LICENSE_QUOTA) {
-			const teamProjectCount = await trx.count(Project, { where: { type: 'team' } });
-			if (teamProjectCount >= limit) {
-				throw new TeamProjectOverQuotaError(limit);
+	async getMyProjects(user: User): Promise<ProjectWithRelationsAndScopes[]> {
+		const projectRelations = await this.getProjectRelationsForUser(user);
+		const otherTeamProjects = hasGlobalScope(user, 'project:read')
+			? await this.projectRepository.findTeamProjectsExcluding(
+					projectRelations.map((relation) => relation.projectId),
+				)
+			: [];
+
+		const results: ProjectWithRelationsAndScopes[] = [];
+
+		for (const relation of projectRelations) {
+			const result: ProjectWithRelationsAndScopes = Object.assign(
+				this.projectRepository.create(relation.project),
+				{ role: relation.role.slug, scopes: [] },
+			);
+
+			if (result.scopes) {
+				result.scopes.push(
+					...combineScopes({
+						global: getAuthPrincipalScopes(user),
+						project: relation.role.scopes.map((scope) => scope.slug),
+					}),
+				);
+			}
+
+			results.push(result);
+		}
+
+		for (const project of otherTeamProjects) {
+			const result: ProjectWithRelationsAndScopes = Object.assign(
+				this.projectRepository.create(project),
+				{
+					// If the user has the global `project:read` scope then they may not
+					// own this relationship in that case we use the global user role
+					// instead of the relation role, which is for another user.
+					role: user.role.slug,
+					scopes: [],
+				},
+			);
+
+			if (result.scopes) {
+				result.scopes.push(...combineScopes({ global: getAuthPrincipalScopes(user) }));
+			}
+
+			results.push(result);
+		}
+
+		// Deduplicate and sort scopes
+		for (const result of results) {
+			if (result.scopes) {
+				result.scopes = [...new Set(result.scopes)].sort();
 			}
 		}
 
-		const project = await trx.save(
-			Project,
-			this.projectRepository.create({
-				...data,
-				...overrides,
-				type: 'team',
-				creatorId: adminUser.id,
-			}),
-		);
-
-		// Link admin
-		await this.addUser(project.id, { userId: adminUser.id, role: 'project:admin' }, trx);
-
-		return project;
+		return results;
 	}
 
 	async createTeamProject(
@@ -411,24 +486,50 @@ export class ProjectService {
 		data: CreateProjectDto,
 		overrides: ProjectCreateOverrides = {},
 	): Promise<Project> {
-		// This needs to be SERIALIZABLE otherwise the count would not block a
-		// concurrent transaction and we could insert multiple projects.
-		return await this.projectRepository.manager.transaction('SERIALIZABLE', async (trx) => {
-			return await this.createTeamProjectWithEntityManager(adminUser, data, trx, overrides);
+		const limit = this.licenseState.getMaxTeamProjects();
+		let project: Project | null;
+		try {
+			project = await this.projectRepository.insertTeamProjectWithAdmin(
+				{
+					name: data.name,
+					icon: data.icon ?? null,
+					id: overrides.id,
+					description: overrides.description ?? null,
+					customTelemetryTags: overrides.customTelemetryTags ?? [],
+				},
+				adminUser.id,
+				limit,
+			);
+		} catch (error) {
+			if (error instanceof ProjectIdConflictError) throw new ConflictError(error.message);
+			throw error;
+		}
+		if (!project) throw new TeamProjectOverQuotaError(limit);
+
+		this.eventService.emit('team-project-created', {
+			userId: adminUser.id,
+			role: adminUser.role.slug,
+			uiContext: data.uiContext,
 		});
+
+		return project;
 	}
 
 	async updateProject(
+		user: User,
 		projectId: string,
 		{ name, icon, description, customTelemetryTags }: UpdateProjectDto,
+		{ preserveCustomTelemetryTags = false }: { preserveCustomTelemetryTags?: boolean } = {},
 	): Promise<void> {
-		const trimmedTags = customTelemetryTags
-			?.map(({ key, value }) => ({ key: key.trim(), value }))
-			.filter(({ key }) => key !== '');
+		const tags = preserveCustomTelemetryTags
+			? customTelemetryTags
+			: customTelemetryTags
+					?.map(({ key, value }) => ({ key: key.trim(), value }))
+					.filter(({ key }) => key !== '');
 
 		const result = await this.projectRepository.update(
 			{ id: projectId, type: 'team' },
-			{ name, icon, description, customTelemetryTags: trimmedTags },
+			{ name, icon, description, customTelemetryTags: tags },
 		);
 		if (!result.affected) {
 			throw new ProjectNotFoundError(projectId);
@@ -436,6 +537,15 @@ export class ProjectService {
 
 		// Ensure OTel spans pick up the updated customTelemetryTags on the next execution.
 		await this.ownershipService.invalidateWorkflowProjectCacheForProject(projectId);
+
+		this.eventService.emit('team-project-updated', {
+			userId: user.id,
+			role: user.role.slug,
+			projectId,
+			...(customTelemetryTags !== undefined
+				? { otelProjectCustomTagsCount: customTelemetryTags.length }
+				: {}),
+		});
 	}
 
 	async getPersonalProject(user: User): Promise<Project | null> {
@@ -500,6 +610,29 @@ export class ProjectService {
 		return { project, newRelations };
 	}
 
+	private async notifyNewSharees(
+		sharer: User,
+		project: Project,
+		newSharees: Array<{ userId: string; role: AssignableProjectRole }>,
+	) {
+		if (newSharees.length === 0) return;
+		await this.userManagementMailer.notifyProjectShared({
+			sharer,
+			newSharees,
+			project: { id: project.id, name: project.name },
+		});
+	}
+
+	private async emitProjectMembersUpdated(user: User, projectId: string) {
+		const relations = await this.getProjectRelations(projectId);
+		this.eventService.emit('team-project-updated', {
+			userId: user.id,
+			role: user.role.slug,
+			members: relations.map((r) => ({ userId: r.userId, role: r.role.slug })),
+			projectId,
+		});
+	}
+
 	/**
 	 * Adds users to a team project with specified roles.
 	 *
@@ -507,6 +640,7 @@ export class ProjectService {
 	 * Throws if the relations contain `project:personalOwner`.
 	 */
 	async addUsersToProject(
+		user: User,
 		projectId: string,
 		relations: Array<{ userId: string; role: AssignableProjectRole }>,
 	) {
@@ -527,6 +661,9 @@ export class ProjectService {
 			throw new ForbiddenError("Can't add a personalOwner to a team project.");
 		}
 
+		const existingUserIds = new Set(project.projectRelations.map((pr) => pr.userId));
+		const newSharees = relations.filter((relation) => !existingUserIds.has(relation.userId));
+
 		await this.projectRelationRepository.save(
 			relations.map((relation) => ({
 				projectId,
@@ -534,6 +671,9 @@ export class ProjectService {
 				role: { slug: relation.role },
 			})),
 		);
+
+		await this.notifyNewSharees(user, project, newSharees);
+		await this.emitProjectMembersUpdated(user, projectId);
 	}
 
 	/**
@@ -543,6 +683,7 @@ export class ProjectService {
 	 * - Reports conflicts for users already in the project with a different role (no change)
 	 */
 	async addUsersWithConflictSemantics(
+		user: User,
 		projectId: string,
 		relations: Array<{ userId: string; role: AssignableProjectRole }>,
 	): Promise<{
@@ -594,6 +735,9 @@ export class ProjectService {
 			added.push(...toInsert);
 		}
 
+		await this.notifyNewSharees(user, project, added);
+		await this.emitProjectMembersUpdated(user, project.id);
+
 		return { project, added, conflicts };
 	}
 
@@ -627,7 +771,7 @@ export class ProjectService {
 		);
 	}
 
-	async deleteUserFromProject(projectId: string, userId: string) {
+	async deleteUserFromProject(user: User, projectId: string, userId: string) {
 		const project = await this.getTeamProjectWithRelations(projectId);
 
 		// Prevent project owner from being removed
@@ -641,9 +785,16 @@ export class ProjectService {
 			await em.delete(ProjectRelation, { projectId: project.id, userId });
 			await proxy.cleanupOrphanedEntriesForUsers([userId], em);
 		});
+
+		await this.emitProjectMembersUpdated(user, projectId);
 	}
 
-	async changeUserRoleInProject(projectId: string, userId: string, role: AssignableProjectRole) {
+	async changeUserRoleInProject(
+		user: User,
+		projectId: string,
+		userId: string,
+		role: AssignableProjectRole,
+	) {
 		if (role === PROJECT_OWNER_ROLE_SLUG) {
 			throw new ForbiddenError('Personal owner cannot be added to a team project.');
 		}
@@ -673,6 +824,8 @@ export class ProjectService {
 			await em.update(ProjectRelation, { projectId, userId }, { role: { slug: role } });
 			await proxy.cleanupOrphanedEntriesForUsers([userId], em);
 		});
+
+		await this.emitProjectMembersUpdated(user, projectId);
 	}
 
 	async pruneRelations(em: EntityManager, project: Project) {
@@ -827,6 +980,10 @@ export class ProjectService {
 		});
 	}
 
+	async findUserIdsByProjectId(projectId: string): Promise<string[]> {
+		return await this.projectRelationRepository.findUserIdsByProjectId(projectId);
+	}
+
 	async getProjectRelationForUserAndProject(
 		userId: string,
 		projectId: string,
@@ -835,6 +992,30 @@ export class ProjectService {
 			where: { projectId, userId },
 			relations: { user: true, role: true },
 		});
+	}
+
+	async getProjectMembersAndCount(
+		projectId: string,
+		{ offset, limit }: { offset: number; limit: number },
+	): Promise<{ members: ProjectRelation[]; count: number }> {
+		const [members, count] = await this.projectRelationRepository.findAndCount({
+			where: { projectId },
+			relations: { user: true, role: true },
+			order: { createdAt: 'ASC', userId: 'ASC' },
+			skip: offset,
+			take: limit,
+		});
+		return { members, count };
+	}
+
+	async getProjectScopesForUser(user: User, projectId: string): Promise<Scope[]> {
+		const relation = await this.getProjectRelationForUserAndProject(user.id, projectId);
+		return [
+			...combineScopes({
+				global: getAuthPrincipalScopes(user),
+				project: relation?.role.scopes.map((scope) => scope.slug) ?? [],
+			}),
+		];
 	}
 
 	async getUserOwnedOrAdminProjects(userId: string): Promise<Project[]> {

@@ -2,7 +2,7 @@
 import { computed } from 'vue';
 import { DEFAULT_AGENT_PERSONALISATION } from '@n8n/api-types';
 import { N8nIconPicker, N8nInlineTextEdit } from '@n8n/design-system';
-import type { IconOrEmoji } from '@n8n/design-system/components/N8nIconPicker/types';
+import type { IconOrEmoji } from '@n8n/design-system';
 import { useI18n } from '@n8n/i18n';
 
 import type { AgentJsonConfig } from '../types';
@@ -67,10 +67,13 @@ function personalisationStyle(value: AgentPersonalisation): Record<string, strin
 </script>
 
 <template>
-	<div :class="$style.text" data-testid="agent-identity-header">
+	<div
+		:class="$style.text"
+		:style="personalisationStyle(personalisation)"
+		data-testid="agent-identity-header"
+	>
 		<N8nIconPicker
 			v-model="iconPickerModel"
-			:style="personalisationStyle(personalisation)"
 			:button-tooltip="i18n.baseText('agents.builder.agent.personalisation.change')"
 			button-size="xlarge"
 			:is-read-only="props.disabled"

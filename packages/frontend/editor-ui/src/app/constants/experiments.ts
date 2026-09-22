@@ -1,10 +1,12 @@
-import { INSTANCE_AI_MCP_CONNECTIONS_FLAG } from '@n8n/api-types';
+import { INSTANCE_AI_PROGRESSIVE_BUILDING_FLAG } from '@n8n/api-types';
 
-function createExperiment<T extends Record<string, string>>(
-	name: string,
-	variants: T,
-): { name: string } & T;
-function createExperiment(name: string): { name: string; control: 'control'; variant: 'variant' };
+function createExperiment<
+	const TName extends string,
+	const TVariants extends Record<string, string>,
+>(name: TName, variants: TVariants): { name: TName } & TVariants;
+function createExperiment<const TName extends string>(
+	name: TName,
+): { name: TName; control: 'control'; variant: 'variant' };
 function createExperiment(name: string, variants?: Record<string, string>) {
 	return { name, ...(variants ?? { control: 'control', variant: 'variant' }) } as const;
 }
@@ -98,9 +100,6 @@ export const SURFACE_MCP_TO_NEW_CLOUD_USERS_EXPERIMENT = createExperiment(
 );
 
 export const EVALUATIONS_WIZARD_SIDEPANEL_EXPERIMENT = createExperiment('088_config_evaluations');
-export const INSTANCE_AI_WORKFLOW_PREVIEW_SUGGESTIONS_EXPERIMENT = createExperiment(
-	'087_instance_ai_workflow_preview_suggestions',
-);
 export const INSTANCE_AI_PERSONALIZED_PROMPT_SUGGESTIONS_EXPERIMENT = createExperiment(
 	'093_instance_ai_personalized_prompt_suggestions',
 	{
@@ -108,10 +107,6 @@ export const INSTANCE_AI_PERSONALIZED_PROMPT_SUGGESTIONS_EXPERIMENT = createExpe
 		variantCards: 'variant-cards',
 		variantList: 'variant-list',
 	},
-);
-
-export const INSTANCE_AI_MCP_CONNECTIONS_EXPERIMENT = createExperiment(
-	INSTANCE_AI_MCP_CONNECTIONS_FLAG,
 );
 
 export const INSTANCE_AI_SPLIT_EMPTY_STATE_EXPERIMENT = createExperiment(
@@ -122,9 +117,6 @@ export const INSTANCE_AI_BROWSER_USE_EXPERIMENT = createExperiment('090_instance
 
 export const INSTANCE_AI_COMPUTER_USE_EXPERIMENT = createExperiment('091_instance_ai_computer_use');
 
-export const INSTANCE_AI_TEMPLATE_EXAMPLES_EXPERIMENT = createExperiment(
-	'092_instance_ai_template_examples',
-);
 export const INSTANCE_AI_BROWSER_CREDENTIAL_SETUP_EXPERIMENT = createExperiment(
 	'094_instance_ai_browser_credential_setup',
 );
@@ -132,17 +124,35 @@ export const INSTANCE_AI_BROWSER_CREDENTIAL_SETUP_EXPERIMENT = createExperiment(
 export const EXPOSE_ALL_WORKFLOWS_TO_MCP_EXPERIMENT = createExperiment(
 	'095_expose_all_workflows_to_mcp',
 );
-export const ENHANCED_HITL_SLACK_EXPERIMENT = createExperiment('096_enhanced_hitl_slack');
-export const ENHANCED_HITL_TELEGRAM_EXPERIMENT = createExperiment('097_enhanced_hitl_telegram');
-
-export const N8N_CREDITS_CREDENTIAL_SELECTION_EXPERIMENT = createExperiment(
-	'100_n8n_credits_credential_selection',
-);
-
 export const TRIAL_INTRO_MODAL_EXPERIMENT = createExperiment('101_trial_intro_modal');
 export const INLINE_AGENTS_EXPERIMENT = createExperiment('103_inline_agents');
+export const INSTANCE_AI_FREE_NUDGE_EXPERIMENT = createExperiment('105_instance_ai_free_nudge', {
+	control: 'control',
+	variant1: 'variant-1',
+	variant2: 'variant-2',
+});
+
+export const OPEN_WORKFLOW_IN_ASSISTANT_EXPERIMENT = createExperiment(
+	'108_open_workflow_in_assistant',
+);
+
+export const INSTANCE_AI_INSPIRATION_FROM_TAXONOMY_EXPERIMENT = createExperiment(
+	'112_aia_inspiration_from_taxonomy',
+);
+
+export const INSTANCE_AI_PROGRESSIVE_BUILDING_EXPERIMENT = createExperiment(
+	INSTANCE_AI_PROGRESSIVE_BUILDING_FLAG,
+);
+
+/**
+ * Multivariate: the enabled arm is the variant string `variant`, not a boolean,
+ * so the check goes through `isVariantEnabled` rather than `isFeatureEnabled`.
+ * The default `control` / `variant` arms match the PostHog flag.
+ */
+export const MCP_JSON_NUDGE_EXPERIMENT = createExperiment('113_mcp_nudge_modal_on_export_import');
 
 export const EXPERIMENTS_TO_TRACK = [
+	INSTANCE_AI_PROGRESSIVE_BUILDING_EXPERIMENT.name,
 	EXTRA_TEMPLATE_LINKS_EXPERIMENT.name,
 	TEMPLATE_ONBOARDING_EXPERIMENT.name,
 	BATCH_11AUG_EXPERIMENT.name,
@@ -168,18 +178,16 @@ export const EXPERIMENTS_TO_TRACK = [
 	FLOATING_CHAT_HUB_PANEL_EXPERIMENT.name,
 	SURFACE_MCP_TO_NEW_CLOUD_USERS_EXPERIMENT.name,
 	EVALUATIONS_WIZARD_SIDEPANEL_EXPERIMENT.name,
-	INSTANCE_AI_WORKFLOW_PREVIEW_SUGGESTIONS_EXPERIMENT.name,
-	INSTANCE_AI_MCP_CONNECTIONS_EXPERIMENT.name,
 	INSTANCE_AI_PERSONALIZED_PROMPT_SUGGESTIONS_EXPERIMENT.name,
 	INSTANCE_AI_SPLIT_EMPTY_STATE_EXPERIMENT.name,
 	INSTANCE_AI_BROWSER_USE_EXPERIMENT.name,
 	INSTANCE_AI_COMPUTER_USE_EXPERIMENT.name,
-	INSTANCE_AI_TEMPLATE_EXAMPLES_EXPERIMENT.name,
 	INSTANCE_AI_BROWSER_CREDENTIAL_SETUP_EXPERIMENT.name,
 	EXPOSE_ALL_WORKFLOWS_TO_MCP_EXPERIMENT.name,
-	ENHANCED_HITL_SLACK_EXPERIMENT.name,
-	ENHANCED_HITL_TELEGRAM_EXPERIMENT.name,
-	N8N_CREDITS_CREDENTIAL_SELECTION_EXPERIMENT.name,
 	TRIAL_INTRO_MODAL_EXPERIMENT.name,
 	INLINE_AGENTS_EXPERIMENT.name,
+	INSTANCE_AI_FREE_NUDGE_EXPERIMENT.name,
+	OPEN_WORKFLOW_IN_ASSISTANT_EXPERIMENT.name,
+	INSTANCE_AI_INSPIRATION_FROM_TAXONOMY_EXPERIMENT.name,
+	MCP_JSON_NUDGE_EXPERIMENT.name,
 ];

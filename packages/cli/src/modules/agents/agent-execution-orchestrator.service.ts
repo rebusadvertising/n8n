@@ -1,37 +1,68 @@
 import {
-	INLINE_SUB_AGENT_ID,
-	parseDelegateSubAgentContinuation,
 	type Agent as RuntimeAgent,
 	type SerializableAgentState,
 	type StreamChunk,
 } from '@n8n/agents';
-import type { AgentPersistedMessageDto } from '@n8n/api-types';
+import type {
+	AgentBackgroundJobSignal,
+	AgentMessageAuthor,
+	AgentPersistedMessageDto,
+} from '@n8n/api-types';
 import { N8N_CHAT_INTEGRATION_TYPE } from '@n8n/api-types';
 import { Logger } from '@n8n/backend-common';
+import { AiConfig } from '@n8n/config';
 import type { User } from '@n8n/db';
-import { Service } from '@n8n/di';
-import { isRecord } from '@n8n/utils/is-record';
-import { UserError } from 'n8n-workflow';
+import { Container, Service } from '@n8n/di';
+import { OperationalError, UserError } from 'n8n-workflow';
 
 import { ExternalHooks } from '@/external-hooks';
 import type { AgentRunTelemetryType, IAgentConfigurationTelemetryProperties } from '@/interfaces';
 import { Telemetry } from '@/telemetry';
 
+import { AgentExecutionService, type StartExecutionParams } from './agent-execution.service';
+import type { AgentThreadAccess } from './entities/agent-execution-thread.entity';
+import type { AgentSessionMode } from './utils/agent-thread-access';
 import {
-	AgentExecutionService,
-	type RecordMessageParams,
-	type StartExecutionParams,
-} from './agent-execution.service';
+	draftChatMemoryResourceId,
+	isTaskRunMemoryResourceId,
+	userIdFromDraftChatMemoryResourceId,
+} from './utils/agent-memory-scope';
+import { threadBelongsTo } from './utils/agent-thread-access';
 import { AgentRunTracingService, modelIdFromSnapshot } from './agent-run-tracing.service';
-import { AgentRuntimeCacheService } from './agent-runtime-cache.service';
-import { ExecutionRecorder, type MessageRecord } from './execution-recorder';
+import {
+	AgentRuntimeCacheService,
+	type AgentRuntime,
+	type GetRuntimeParams,
+} from './agent-runtime-cache.service';
+import {
+	decodeAgentSandboxHostMetadata,
+	encodeAgentSandboxHostMetadata,
+	hashAgentSandboxPrincipal,
+	type AgentSandboxPrincipalHash,
+} from './agent-sandbox-principal';
+import { AgentSandboxRuntimeService } from './agent-sandbox-runtime.service';
+import { buildAgentConfigurationTelemetry } from './agent-telemetry';
+import { AgentTurnExecutionService } from './agent-turn-execution.service';
+import { AgentExecutionRecordingError } from './agent-execution-recording.error';
+import type { AgentChatBridge } from './integrations/agent-chat-bridge';
+import {
+	encodeIntegrationMessageContext,
+	inheritIntegrationMessageContext,
+} from './integrations/integration-message-context';
+import type {
+	IntegrationMessageContext,
+	SessionBinding,
+} from './integrations/integration-tool-types';
 import { IntegrationMessageContextService } from './integrations/integration-message-context.service';
 import { N8NCheckpointStorage } from './integrations/n8n-checkpoint-storage';
+import { modelStreamStallOptions } from './model-stream-stall-options';
+import { AgentRepository } from './repositories/agent.repository';
 import type { ToolRegistry } from './tool-registry';
 import type { StoredAttachmentRef } from './agent-chat-attachment.service';
 import { createAgentExecutionCounter } from './utils/agent-execution-counter';
+import { getPublishedAgentSnapshot } from './utils/agent-published-snapshot';
+import { getDelegatedChildCheckpoints } from './utils/delegated-child-checkpoints';
 import { buildInboundUserMessage } from './utils/inbound-attachments';
-import { streamAgentChunks } from './utils/agent-stream';
 import { executionsToMessagesDto } from './utils/execution-to-message-mapper';
 
 export interface AgentMemoryScope {
@@ -52,36 +83,61 @@ export interface ExecuteForChatConfig {
 	user: User;
 	/** Memory scope — resourceId is the chat platform user (e.g. Slack / Telegram user ID). */
 	memory: AgentMemoryScope;
+	sessionMode?: AgentSessionMode;
 	/** Stored attachments to include as file parts on the user turn. */
 	attachments?: StoredAttachmentRef[];
+	/** Identifies the surface that started the draft test run. */
+	source?: string;
+	/**
+	 * Set by the in-app preview chat, which builds the runtime with an extra
+	 * instruction saying the agent cannot change its own setup. Other draft
+	 * callers (AI Assistant test calls, MCP, "Run now") leave it unset.
+	 */
+	previewChat?: boolean;
 	/** Fired after the turn is persisted; used to attach `executionId` to SSE `done`. */
 	onExecutionRecorded?: (executionId: string) => void;
 	abortSignal?: AbortSignal;
 }
 
 export interface ExecuteForChatPublishedConfig {
+	messageContext?: IntegrationMessageContext | null;
+	/** Platform conversation metadata scope. Execution memory can belong to a task. */
+	contextConversation?: SessionBinding;
 	agentId: string;
 	projectId: string;
+	/** What the user wrote; recorded in the execution transcript. */
 	message: string;
+	/** What the model receives when it differs from `message`, e.g. with an author label or thread history. */
+	modelMessage?: string;
+	/** Chat platform user who wrote the turn; shown as the sender in the sessions view. */
+	author?: AgentMessageAuthor;
 	/** Memory scope — resourceId is the chat platform user (e.g. Slack / Telegram user ID). */
 	memory: AgentMemoryScope;
+	sessionMode?: AgentSessionMode;
 	attachments?: StoredAttachmentRef[];
 	integrationType?: string;
+	sandboxPrincipalHash: AgentSandboxPrincipalHash;
 	// No `user` field here: a published chat integration (Slack, Telegram, …)
 	// run is triggered by an inbound platform event, not an interactive n8n
-	// session — there is no n8n `User` to attach. This path keeps the
-	// project-scoped trust boundary that existed before per-user tool
-	// gating; the admin who published the agent is the one who approved its
+	// session — there is no n8n `User` to attach. The admin who published the
+	// agent is the one who approved its
 	// tools, and Layer A's node denylist (`EphemeralNodeExecutor`) still
 	// applies regardless.
 }
 
 export interface ResumeForChatConfig {
+	messageContext?: IntegrationMessageContext | null;
+	/** Platform conversation metadata scope. Execution memory can belong to a task. */
+	contextConversation?: SessionBinding;
 	agentId: string;
 	projectId: string;
 	runId: string;
 	toolCallId: string;
 	resumeData: unknown;
+	/** Expected memory scope used to prevent resuming another user's or thread's checkpoint. */
+	expectedMemory?: Partial<AgentMemoryScope>;
+	/** Identifies the surface that resumed the execution. */
+	source?: string;
 	/**
 	 * The calling n8n user for in-app preview chat resumes — used to gate
 	 * node/workflow tools by their access. Absent for published/integration
@@ -97,6 +153,12 @@ export interface ResumeForChatConfig {
 	 * persisted tool call references a tool the rebuilt runtime doesn't know.
 	 */
 	integrationType?: string;
+	/**
+	 * Set by the in-app preview chat, which builds the runtime with an extra
+	 * instruction saying the agent cannot change its own setup. Other draft
+	 * callers (AI Assistant test calls, MCP, "Run now") leave it unset.
+	 */
+	previewChat?: boolean;
 	/** Fired after the resumed turn is persisted; used to attach `executionId` to SSE `done`. */
 	onExecutionRecorded?: (executionId: string) => void;
 	abortSignal?: AbortSignal;
@@ -112,10 +174,6 @@ export interface ExecuteForTaskPublishedConfig {
 	taskId: string;
 	/** Published agent_history version that supplied the scheduled task snapshot. */
 	taskVersionId: string;
-	// No `user` field here: this run is fired by `ScheduledTaskManager` on a
-	// cron tick — there is no human in the loop at all, let alone an n8n
-	// session, so there's nothing to gate tools against. Same project-scoped
-	// trust boundary as `ExecuteForChatPublishedConfig`.
 }
 
 export interface ExecuteForTaskNowConfig {
@@ -136,12 +194,37 @@ export interface ExecuteForTaskNowConfig {
 	taskId: string;
 }
 
+export interface ExecuteForWakeConfig {
+	backgroundJobSignal: AgentBackgroundJobSignal;
+	agentId: string;
+	projectId: string;
+	message: string;
+	memory: AgentMemoryScope;
+	abortSignal: AbortSignal;
+	identity:
+		| { type: 'draft'; user: User; principalHash: AgentSandboxPrincipalHash }
+		| {
+				type: 'published';
+				integrationType: string;
+				principalHash: AgentSandboxPrincipalHash;
+		  };
+}
+
 export interface StreamChatResponseConfig {
+	access: AgentThreadAccess;
+	messageContext?: IntegrationMessageContext | null;
 	agentInstance: RuntimeAgent;
 	toolRegistry: ToolRegistry;
+	/** See `AgentRuntime.mcpServerAttributions`. */
+	mcpServerAttributions: Map<string, string>;
 	agentId: string;
 	userId?: string;
+	/** What the user wrote; recorded in the execution transcript. */
 	message: string;
+	/** What the model receives when it differs from `message`. */
+	modelMessage?: string;
+	/** Chat platform user who wrote the turn; shown as the sender in the sessions view. */
+	author?: AgentMessageAuthor;
 	attachments?: StoredAttachmentRef[];
 	memory: AgentMemoryScope;
 	projectId: string;
@@ -155,64 +238,15 @@ export interface StreamChatResponseConfig {
 	/** Fired after the turn is persisted; used to attach `executionId` to SSE `done`. */
 	onExecutionRecorded?: (executionId: string) => void;
 	abortSignal?: AbortSignal;
-}
-
-function getMaxIterationsChunks(): StreamChunk[] {
-	const id = crypto.randomUUID();
-	return [
-		{ type: 'text-start', id },
-		{
-			type: 'text-delta',
-			id,
-			delta: 'The agent has reached the maximum number of iterations and has stopped.',
-		},
-		{ type: 'text-end', id },
-	];
-}
-
-function normalizeAbortedMessageRecord(
-	record: MessageRecord,
-	abortSignal?: AbortSignal,
-): MessageRecord {
-	if (!abortSignal?.aborted) return record;
-	return { ...record, finishReason: 'cancelled', error: null };
-}
-
-function getDelegatedChildCheckpoints(
-	checkpoint: SerializableAgentState,
-	parentAgentId: string,
-): Array<{ runId: string; agentId: string }> {
-	const childCheckpoints: Array<{ runId: string; agentId: string }> = [];
-	const seen = new Set<string>();
-
-	for (const pendingToolCall of Object.values(checkpoint.pendingToolCalls)) {
-		if (!pendingToolCall.suspended) continue;
-		const childCheckpoint = parseDelegateSubAgentContinuation(pendingToolCall.continuation);
-		if (!childCheckpoint) continue;
-
-		let ownerAgentId: string;
-		if (childCheckpoint.subAgentId === INLINE_SUB_AGENT_ID) {
-			if (childCheckpoint.resumeContext !== undefined) continue;
-			ownerAgentId = parentAgentId;
-		} else {
-			if (
-				!isRecord(childCheckpoint.resumeContext) ||
-				childCheckpoint.resumeContext.agentId !== childCheckpoint.subAgentId ||
-				typeof childCheckpoint.resumeContext.versionId !== 'string' ||
-				childCheckpoint.resumeContext.versionId.length === 0
-			) {
-				continue;
-			}
-			ownerAgentId = childCheckpoint.subAgentId;
-		}
-
-		const identity = `${ownerAgentId}\0${childCheckpoint.runId}`;
-		if (seen.has(identity)) continue;
-		seen.add(identity);
-		childCheckpoints.push({ runId: childCheckpoint.runId, agentId: ownerAgentId });
-	}
-
-	return childCheckpoints;
+	/** Add full sanitized tool configuration to approval cards in preview chat. */
+	includeHitlToolDetails?: boolean;
+	sandboxPrincipalHash: AgentSandboxPrincipalHash;
+	/** Hide the internal wake instruction from the execution transcript. */
+	hideUserMessageFromTranscript?: boolean;
+	/** Prevent this wake run from triggering another wake. */
+	isWakeRun?: boolean;
+	backgroundJobSignal?: AgentBackgroundJobSignal;
+	sessionMode?: AgentSessionMode;
 }
 
 /**
@@ -228,12 +262,20 @@ export class AgentExecutionOrchestratorService {
 		private readonly logger: Logger,
 		private readonly n8nCheckpointStorage: N8NCheckpointStorage,
 		private readonly agentExecutionService: AgentExecutionService,
+		private readonly turnExecutionService: AgentTurnExecutionService,
 		private readonly telemetry: Telemetry,
 		private readonly runtimeCacheService: AgentRuntimeCacheService,
 		private readonly integrationMessageContextService: IntegrationMessageContextService,
 		private readonly agentRunTracingService: AgentRunTracingService,
 		private readonly externalHooks: ExternalHooks,
+		private readonly agentSandboxRuntimeService: AgentSandboxRuntimeService,
+		private readonly agentRepository: AgentRepository,
+		private readonly aiConfig: AiConfig,
 	) {}
+
+	async getSessionMode(threadId: string): Promise<AgentSessionMode> {
+		return await this.agentExecutionService.getSessionMode(threadId);
+	}
 
 	/**
 	 * Return user-visible conversation history for a persisted chat thread.
@@ -246,9 +288,15 @@ export class AgentExecutionOrchestratorService {
 		threadId: string;
 		projectId: string;
 		agentId: string;
+		userId: string;
 	}): Promise<AgentPersistedMessageDto[] | null> {
-		const { threadId, projectId, agentId } = params;
-		const detail = await this.agentExecutionService.getThreadDetail(threadId, projectId, agentId);
+		const { threadId, projectId, agentId, userId } = params;
+		const detail = await this.agentExecutionService.getThreadDetail(
+			threadId,
+			projectId,
+			agentId,
+			userId,
+		);
 		if (!detail) return null;
 		return executionsToMessagesDto(detail.executions);
 	}
@@ -274,6 +322,11 @@ export class AgentExecutionOrchestratorService {
 		) {
 			return false;
 		}
+		const thread = await this.agentExecutionService.findThreadById(checkpoint.persistence.threadId);
+		const userId = userIdFromDraftChatMemoryResourceId(params.resourceId);
+		if (thread && (!userId || !threadBelongsTo(thread, thread.projectId, params.agentId, userId))) {
+			return false;
+		}
 
 		const childCheckpoints = getDelegatedChildCheckpoints(checkpoint, params.agentId);
 		if (checkpointStatus.status === 'active') {
@@ -294,25 +347,21 @@ export class AgentExecutionOrchestratorService {
 		return true;
 	}
 
-	/**
-	 * Resume a suspended tool call and yield the resulting stream chunks.
-	 * Used by chat integration handlers to continue an agent run after
-	 * a human-in-the-loop action (button click, modal submission).
-	 */
-	async *resumeForChat(config: ResumeForChatConfig): AsyncGenerator<StreamChunk> {
-		const {
-			agentId,
-			projectId,
-			runId,
-			toolCallId,
-			resumeData,
-			integrationType,
-			user,
-			usePublishedVersion = true,
-			onExecutionRecorded,
-			abortSignal,
-		} = config;
-
+	private async loadResumeCheckpoint(params: {
+		agentId: string;
+		projectId: string;
+		runId: string;
+		expectedMemory: Partial<AgentMemoryScope> | undefined;
+		user: User | undefined;
+		usePublishedVersion: boolean;
+		previewChat: boolean | undefined;
+	}): Promise<{
+		memoryScope: NonNullable<SerializableAgentState['persistence']>;
+		sandboxPrincipalHash: AgentSandboxPrincipalHash | undefined;
+		access: AgentThreadAccess;
+	}> {
+		const { agentId, projectId, runId, expectedMemory, user, usePublishedVersion, previewChat } =
+			params;
 		const checkpointStatus = await this.n8nCheckpointStorage.getStatus(runId, agentId);
 		if (checkpointStatus.status === 'expired') {
 			throw new UserError(`Checkpoint ${runId} is expired and cannot be resumed`);
@@ -329,111 +378,202 @@ export class AgentExecutionOrchestratorService {
 		if (memoryScope.delegated === true) {
 			throw new UserError('Delegated actions must be resumed through their parent agent');
 		}
+		if (
+			(expectedMemory?.threadId !== undefined &&
+				memoryScope.threadId !== expectedMemory.threadId) ||
+			(expectedMemory?.resourceId !== undefined &&
+				memoryScope.resourceId !== expectedMemory.resourceId)
+		) {
+			throw new UserError(`Checkpoint ${runId} does not belong to this chat`);
+		}
+		const isPreview = !usePublishedVersion && !isTaskRunMemoryResourceId(memoryScope.resourceId);
+		let access: AgentThreadAccess = { accessScope: 'project', ownerId: null };
+		if (isPreview) {
+			if (
+				!user ||
+				memoryScope.resourceId !== draftChatMemoryResourceId(user.id) ||
+				!(await this.agentExecutionService.canUseDraftThread(
+					memoryScope.threadId,
+					projectId,
+					agentId,
+					user.id,
+					{ previewChat, sessionMode: 'existing' },
+				))
+			) {
+				throw new UserError(`Checkpoint ${runId} does not belong to this chat`);
+			}
+			access = { accessScope: 'user', ownerId: user.id };
+		} else {
+			const thread = await this.agentExecutionService.findThreadById(memoryScope.threadId);
+			if (
+				userIdFromDraftChatMemoryResourceId(memoryScope.resourceId) ||
+				!thread ||
+				thread.projectId !== projectId ||
+				thread.agentId !== agentId ||
+				thread.accessScope !== 'project'
+			) {
+				throw new UserError(`Checkpoint ${runId} does not belong to this chat`);
+			}
+		}
+
+		const sandboxScope = decodeAgentSandboxHostMetadata(memoryScope.hostMetadata);
+		const sandboxPrincipalHash = sandboxScope?.principalHash;
+		if (
+			this.agentSandboxRuntimeService.isEnabled() &&
+			(!sandboxScope ||
+				sandboxScope.projectId !== projectId ||
+				!sandboxPrincipalHash ||
+				(!usePublishedVersion &&
+					(!user ||
+						sandboxPrincipalHash !==
+							hashAgentSandboxPrincipal({ type: 'n8n-user', userId: user.id }))))
+		) {
+			throw new UserError(`Checkpoint ${runId} is unavailable and cannot be resumed`);
+		}
+
+		return { memoryScope, sandboxPrincipalHash, access };
+	}
+
+	/**
+	 * Resume a suspended tool call and yield the resulting stream chunks.
+	 * Used by chat integration handlers to continue an agent run after
+	 * a human-in-the-loop action (button click, modal submission).
+	 */
+	async *resumeForChat(config: ResumeForChatConfig): AsyncGenerator<StreamChunk> {
+		const {
+			agentId,
+			projectId,
+			runId,
+			toolCallId,
+			resumeData,
+			expectedMemory,
+			source,
+			integrationType,
+			user,
+			usePublishedVersion = true,
+			onExecutionRecorded,
+			abortSignal,
+		} = config;
+		const { memoryScope, sandboxPrincipalHash, access } = await this.loadResumeCheckpoint({
+			agentId,
+			projectId,
+			runId,
+			expectedMemory,
+			user,
+			usePublishedVersion,
+			previewChat: config.previewChat,
+		});
 
 		const threadId = memoryScope.threadId;
 
-		const runtime = await this.runtimeCacheService.getRuntime({
-			agentId,
-			projectId,
-			usePublishedVersion,
-			integrationType,
-			// `usePublishedVersion` defaults to true and is what platform
-			// integrations (Slack/Telegram HITL resume) use — those have no
-			// interactive n8n user, so `user` is force-undefined to keep the
-			// existing project-scoped runtime. Only the in-app draft/test-chat
-			// resume passes `usePublishedVersion: false` (see
-			// `AgentChatController.chatResume`), and only then does the caller's
-			// `user` actually reach the cache/reconstruction layer.
-			user: usePublishedVersion ? undefined : user,
-		});
-
-		const { agent: agentInstance, toolRegistry } = runtime;
-		let executionId: string | undefined;
-		const recorder = this.createRecorder(toolRegistry, () => executionId, {
-			projectId,
-			agentId,
-			threadId,
-		});
-		const startedAt = recorder.startedAt;
-		const runType: AgentRunTelemetryType = usePublishedVersion ? 'production' : 'test';
-
-		try {
-			// A resume request carries no `source` of its own — recover it from
-			// the suspended run being resumed so tracing stays consistent across
-			// the suspend/resume cycle. Skipped entirely when tracing is disabled,
-			// since `build()` would discard the result anyway.
-			const suspendedExecution = this.agentRunTracingService.enabled
-				? await this.agentExecutionService.findLatestSuspendedRun(threadId)
-				: undefined;
-
-			const tracing = await this.agentRunTracingService.build({
-				agentId,
-				projectId,
-				threadId,
-				userId: user?.id,
-				source: suspendedExecution?.source ?? 'unknown',
-				modelId: modelIdFromSnapshot(agentInstance.snapshot.model),
-			});
-
-			const resultStream = await agentInstance.resume('stream', resumeData, {
-				runId,
-				toolCallId,
-				executionCounter: createAgentExecutionCounter(this.telemetry, {
-					agentId,
-					userId: user?.id,
-					runType,
-				}),
-				...(tracing ? { telemetry: tracing } : {}),
-				...(abortSignal ? { abortSignal } : {}),
-			});
-			const startParams: StartExecutionParams = {
-				threadId,
-				agentId,
-				agentName: agentInstance.name,
-				projectId,
-				userMessage: null,
-				telemetry: {
-					runType,
-					configuration: runtime.telemetryConfiguration,
-				},
-			};
-			executionId = await this.tryStartExecution(
-				startParams,
-				startedAt,
-				'Failed to start resumed agent execution recording',
-			);
-			for await (const value of streamAgentChunks(resultStream.stream)) {
-				recorder.record(value);
-				yield value;
-			}
-		} catch (error) {
-			recorder.record({ type: 'error', error });
-			recorder.record({ type: 'finish', finishReason: 'error' });
-			throw error;
-		} finally {
-			// Always record resumed executions — even if they suspend again (chained HITL)
-			// or fail while streaming. Don't repeat the original user message — the
-			// pre-suspension execution already has it.
-			const messageRecord = normalizeAbortedMessageRecord(recorder.getMessageRecord(), abortSignal);
-			await this.persistRecordedExecution({
-				executionId,
-				onExecutionRecorded,
-				failureMessage: 'Failed to record resumed agent execution',
-				params: {
-					threadId,
-					agentId,
-					agentName: agentInstance.name,
-					projectId,
-					userMessage: null,
-					record: messageRecord,
-					hitlStatus: recorder.suspended ? 'suspended' : 'resumed',
-					telemetry: {
-						runType,
-						configuration: runtime.telemetryConfiguration,
+		yield* this.withRuntimeLease(
+			async () =>
+				await this.getRuntimeOrRecordFailure(
+					{
+						agentId,
+						projectId,
+						usePublishedVersion,
+						integrationType,
+						// Published integrations retain their project-scoped tool access.
+						user: usePublishedVersion ? undefined : user,
+						...(sandboxPrincipalHash ? { sandboxPrincipalHash } : {}),
+						previewChat: config.previewChat,
 					},
-				},
-			});
-		}
+					{
+						threadId,
+						userMessage: null,
+						source,
+						onExecutionRecorded,
+						abortSignal,
+						access,
+						sessionMode: 'existing',
+					},
+				),
+			(runtime) =>
+				this.turnExecutionService.execute({
+					agentInstance: runtime.agent,
+					toolRegistry: runtime.toolRegistry,
+					mcpServerAttributions: runtime.mcpServerAttributions,
+					context: { projectId, agentId, threadId },
+					includeHitlToolDetails: !usePublishedVersion,
+					onExecutionRecorded,
+					onSettled: async (suspended) => {
+						if (!suspended) await this.requestPendingBackgroundWake(threadId);
+					},
+					prepare: async () => {
+						// Recover the original source only when tracing needs it.
+						const suspendedExecution =
+							this.agentRunTracingService.enabled && source === undefined
+								? await this.agentExecutionService.findLatestSuspendedRun(threadId)
+								: undefined;
+						const executionSource = source ?? suspendedExecution?.source ?? undefined;
+						const runType = usePublishedVersion ? 'production' : 'test';
+						const tracing = await this.agentRunTracingService.build({
+							agentId,
+							projectId,
+							threadId,
+							userId: user?.id,
+							source: executionSource ?? 'unknown',
+							modelId: modelIdFromSnapshot(runtime.agent.snapshot.model),
+						});
+						let messageContext = config.messageContext;
+						if (messageContext === undefined) {
+							messageContext =
+								await this.integrationMessageContextService.getForResume(memoryScope);
+						} else if (messageContext && config.contextConversation) {
+							messageContext = inheritIntegrationMessageContext(
+								messageContext,
+								await this.integrationMessageContextService.getForResume(memoryScope),
+							);
+						}
+						const selectedContext = messageContext;
+						const conversation = config.contextConversation;
+
+						return {
+							type: 'resume',
+							resumeData,
+							options: {
+								runId,
+								toolCallId,
+								hostMetadata: encodeIntegrationMessageContext(selectedContext),
+								...(selectedContext && conversation
+									? {
+											onResumeClaimed: async () =>
+												await this.integrationMessageContextService.installIncoming(
+													selectedContext,
+													memoryScope,
+													conversation,
+												),
+										}
+									: {}),
+								executionCounter: createAgentExecutionCounter(this.telemetry, {
+									agentId,
+									userId: user?.id,
+									runType,
+								}),
+								...modelStreamStallOptions(this.aiConfig),
+								...(tracing ? { telemetry: tracing } : {}),
+								...(abortSignal ? { abortSignal } : {}),
+							},
+							recording: {
+								access,
+								threadId,
+								agentId,
+								agentName: runtime.agent.name,
+								projectId,
+								userMessage: null,
+								sessionMode: 'existing',
+								...(executionSource !== undefined ? { source: executionSource } : {}),
+								telemetry: {
+									userId: user?.id,
+									runType,
+									configuration: runtime.telemetryConfiguration,
+								},
+							},
+						};
+					},
+				}),
+		);
 	}
 
 	/**
@@ -447,43 +587,93 @@ export class AgentExecutionOrchestratorService {
 			user,
 			memory,
 			attachments,
+			source,
+			previewChat,
+			sessionMode = 'new',
 			onExecutionRecorded,
 			abortSignal,
 		} = config;
 
 		// `user` is always set (see ExecuteForChatConfig) — this builds/reuses a
 		// runtime scoped to this specific user's tool access.
-		const runtime = await this.runtimeCacheService.getRuntime({
-			agentId,
-			projectId,
-			integrationType: N8N_CHAT_INTEGRATION_TYPE,
-			user,
-		});
-
-		await this.integrationMessageContextService.setLatest(memory.threadId, memory.resourceId, {
-			integrationConnectionId: N8N_CHAT_INTEGRATION_TYPE,
-			platform: N8N_CHAT_INTEGRATION_TYPE,
-			target: { type: 'dm', userId: user.id, threadId: memory.threadId },
-			interactingUserId: user.id,
-			updatedAt: new Date().toISOString(),
-		});
-
-		yield* this.streamChatResponse({
-			agentInstance: runtime.agent,
-			toolRegistry: runtime.toolRegistry,
-			agentId,
+		const sandboxPrincipalHash = hashAgentSandboxPrincipal({
+			type: 'n8n-user',
 			userId: user.id,
-			message,
-			attachments,
-			memory,
-			projectId: runtime.projectId,
-			telemetry: {
-				runType: 'test',
-				configuration: runtime.telemetryConfiguration,
-			},
-			onExecutionRecorded,
-			abortSignal,
 		});
+		if (
+			memory.resourceId !== draftChatMemoryResourceId(user.id) ||
+			!(await this.agentExecutionService.canUseDraftThread(
+				memory.threadId,
+				projectId,
+				agentId,
+				user.id,
+				{ previewChat, sessionMode },
+			))
+		) {
+			throw new UserError('Session not found');
+		}
+		const access: AgentThreadAccess = { accessScope: 'user', ownerId: user.id };
+		yield* this.withRuntimeLease(
+			async () =>
+				await this.getRuntimeOrRecordFailure(
+					{
+						agentId,
+						projectId,
+						integrationType: N8N_CHAT_INTEGRATION_TYPE,
+						user,
+						sandboxPrincipalHash,
+						previewChat,
+					},
+					{
+						threadId: memory.threadId,
+						access,
+						userMessage: message,
+						attachments,
+						source,
+						onExecutionRecorded,
+						abortSignal,
+						sessionMode,
+					},
+				),
+			async (runtime) => {
+				const messageContext: IntegrationMessageContext = {
+					integrationConnectionId: N8N_CHAT_INTEGRATION_TYPE,
+					platform: N8N_CHAT_INTEGRATION_TYPE,
+					target: { type: 'dm', userId: user.id, threadId: memory.threadId },
+					interactingUserId: user.id,
+					updatedAt: new Date().toISOString(),
+				};
+				await this.integrationMessageContextService.setLatest(
+					memory.threadId,
+					memory.resourceId,
+					messageContext,
+				);
+
+				return this.streamChatResponse({
+					access,
+					messageContext,
+					agentInstance: runtime.agent,
+					toolRegistry: runtime.toolRegistry,
+					mcpServerAttributions: runtime.mcpServerAttributions,
+					agentId,
+					userId: user.id,
+					message,
+					attachments,
+					memory,
+					projectId: runtime.projectId,
+					source,
+					telemetry: {
+						runType: 'test',
+						configuration: runtime.telemetryConfiguration,
+					},
+					onExecutionRecorded,
+					abortSignal,
+					includeHitlToolDetails: true,
+					sandboxPrincipalHash,
+					sessionMode,
+				});
+			},
+		);
 	}
 
 	/**
@@ -494,34 +684,78 @@ export class AgentExecutionOrchestratorService {
 	async *executeForChatPublished(
 		config: ExecuteForChatPublishedConfig,
 	): AsyncGenerator<StreamChunk> {
-		const { agentId, projectId, message, memory, integrationType, attachments } = config;
-		await this.externalHooks.run('agent.preExecute', [agentId]);
-
-		// No `user` (see ExecuteForChatPublishedConfig): this is the shared,
-		// project-scoped runtime — every caller of this published agent through
-		// this integration reuses the same cache entry regardless of who
-		// triggered the platform event.
-		const runtime = await this.runtimeCacheService.getRuntime({
+		const {
 			agentId,
 			projectId,
-			integrationType,
-			usePublishedVersion: true,
-		});
-
-		yield* this.streamChatResponse({
-			agentInstance: runtime.agent,
-			toolRegistry: runtime.toolRegistry,
-			agentId,
 			message,
-			attachments,
+			modelMessage,
+			author,
 			memory,
-			projectId: runtime.projectId,
-			source: integrationType,
-			telemetry: {
-				runType: 'production',
-				configuration: runtime.telemetryConfiguration,
+			integrationType,
+			attachments,
+			sandboxPrincipalHash,
+			sessionMode = 'new',
+		} = config;
+		await this.externalHooks.run('agent.preExecute', [agentId]);
+
+		// Published integration runtimes have no n8n user but are isolated by
+		// their external caller's hashed workspace principal.
+		yield* this.withRuntimeLease(
+			async () =>
+				await this.getRuntimeOrRecordFailure(
+					{
+						agentId,
+						projectId,
+						integrationType,
+						usePublishedVersion: true,
+						sandboxPrincipalHash,
+					},
+					{
+						threadId: memory.threadId,
+						userMessage: message,
+						author,
+						attachments,
+						source: integrationType,
+						access: { accessScope: 'project', ownerId: null },
+						sessionMode,
+					},
+				),
+			async (runtime) => {
+				let messageContext = config.messageContext;
+				if (messageContext && config.contextConversation) {
+					messageContext = inheritIntegrationMessageContext(
+						messageContext,
+						await this.integrationMessageContextService.getLatestForIncoming(memory.threadId),
+					);
+					await this.integrationMessageContextService.installIncoming(
+						messageContext,
+						memory,
+						config.contextConversation,
+					);
+				}
+				return this.streamChatResponse({
+					messageContext,
+					access: { accessScope: 'project', ownerId: null },
+					agentInstance: runtime.agent,
+					toolRegistry: runtime.toolRegistry,
+					mcpServerAttributions: runtime.mcpServerAttributions,
+					agentId,
+					message,
+					modelMessage,
+					author,
+					attachments,
+					memory,
+					projectId: runtime.projectId,
+					source: integrationType,
+					telemetry: {
+						runType: 'production',
+						configuration: runtime.telemetryConfiguration,
+					},
+					sandboxPrincipalHash,
+					sessionMode,
+				});
 			},
-		});
+		);
 	}
 
 	/**
@@ -534,30 +768,48 @@ export class AgentExecutionOrchestratorService {
 		const { agentId, projectId, message, memory, taskId, taskVersionId } = config;
 		await this.externalHooks.run('agent.preExecute', [agentId]);
 
-		// No `user` (see ExecuteForTaskPublishedConfig): cron-fired, no human to
-		// attach — same shared, project-scoped runtime for every tick.
-		const runtime = await this.runtimeCacheService.getRuntime({
-			agentId,
-			projectId,
-			integrationType: 'task',
-			usePublishedVersion: true,
-		});
-
-		yield* this.streamChatResponse({
-			agentInstance: runtime.agent,
-			toolRegistry: runtime.toolRegistry,
-			agentId,
-			message,
-			memory,
-			projectId: runtime.projectId,
-			source: 'task',
-			taskId,
-			taskVersionId,
-			telemetry: {
-				runType: 'production',
-				configuration: runtime.telemetryConfiguration,
-			},
-		});
+		// Cron-fired runs have no n8n user and reuse the scheduled task's scope.
+		const sandboxPrincipalHash = hashAgentSandboxPrincipal({ type: 'scheduled-task', taskId });
+		yield* this.withRuntimeLease(
+			async () =>
+				await this.getRuntimeOrRecordFailure(
+					{
+						agentId,
+						projectId,
+						integrationType: 'task',
+						usePublishedVersion: true,
+						sandboxPrincipalHash,
+						allowBackgroundTasks: false,
+					},
+					{
+						threadId: memory.threadId,
+						userMessage: message,
+						source: 'task',
+						taskId,
+						taskVersionId,
+						access: { accessScope: 'project', ownerId: null },
+					},
+				),
+			(runtime) =>
+				this.streamChatResponse({
+					agentInstance: runtime.agent,
+					toolRegistry: runtime.toolRegistry,
+					mcpServerAttributions: runtime.mcpServerAttributions,
+					agentId,
+					message,
+					memory,
+					projectId: runtime.projectId,
+					source: 'task',
+					taskId,
+					taskVersionId,
+					access: { accessScope: 'project', ownerId: null },
+					telemetry: {
+						runType: 'production',
+						configuration: runtime.telemetryConfiguration,
+					},
+					sandboxPrincipalHash,
+				}),
+		);
 	}
 
 	/**
@@ -570,27 +822,181 @@ export class AgentExecutionOrchestratorService {
 		// `user` is always set (see ExecuteForTaskNowConfig) — manual "Run now"
 		// runs get a runtime scoped to the requesting user's tool access, same
 		// as the in-app test chat.
-		const runtime = await this.runtimeCacheService.getRuntime({
-			agentId,
-			projectId,
-			user,
-		});
-
-		yield* this.streamChatResponse({
-			agentInstance: runtime.agent,
-			toolRegistry: runtime.toolRegistry,
-			agentId,
+		const sandboxPrincipalHash = hashAgentSandboxPrincipal({
+			type: 'n8n-user',
 			userId: user.id,
-			message,
-			memory,
-			projectId: runtime.projectId,
-			source: 'task',
-			taskId,
-			telemetry: {
-				runType: 'test',
-				configuration: runtime.telemetryConfiguration,
-			},
 		});
+		yield* this.withRuntimeLease(
+			async () =>
+				await this.getRuntimeOrRecordFailure(
+					{
+						agentId,
+						projectId,
+						user,
+						sandboxPrincipalHash,
+						allowBackgroundTasks: false,
+					},
+					{
+						threadId: memory.threadId,
+						userMessage: message,
+						source: 'task',
+						taskId,
+						access: { accessScope: 'project', ownerId: null },
+					},
+				),
+			(runtime) =>
+				this.streamChatResponse({
+					agentInstance: runtime.agent,
+					toolRegistry: runtime.toolRegistry,
+					mcpServerAttributions: runtime.mcpServerAttributions,
+					agentId,
+					userId: user.id,
+					message,
+					memory,
+					projectId: runtime.projectId,
+					source: 'task',
+					taskId,
+					access: { accessScope: 'project', ownerId: null },
+					telemetry: {
+						runType: 'test',
+						configuration: runtime.telemetryConfiguration,
+					},
+					sandboxPrincipalHash,
+				}),
+		);
+	}
+
+	async executeForWake(config: ExecuteForWakeConfig): Promise<void> {
+		const { agentId, projectId, message, memory, identity, abortSignal } = config;
+		const isDraft = identity.type === 'draft';
+		const access: AgentThreadAccess = isDraft
+			? { accessScope: 'user', ownerId: identity.user.id }
+			: { accessScope: 'project', ownerId: null };
+		if (
+			isDraft &&
+			(memory.resourceId !== draftChatMemoryResourceId(identity.user.id) ||
+				!(await this.agentExecutionService.canUseDraftThread(
+					memory.threadId,
+					projectId,
+					agentId,
+					identity.user.id,
+					{ sessionMode: 'existing' },
+				)))
+		) {
+			throw new UserError('Session not found');
+		}
+
+		// Draft wakes skip the quota hook, like other test chat runs.
+		if (!isDraft) await this.externalHooks.run('agent.preExecute', [agentId]);
+
+		const integrationType = isDraft ? N8N_CHAT_INTEGRATION_TYPE : identity.integrationType;
+		const messageContext = await this.integrationMessageContextService.getLatest(memory.threadId);
+		const delivery = isDraft
+			? undefined
+			: await this.getWakeDelivery(agentId, integrationType, messageContext);
+		const stream = this.withRuntimeLease(
+			async () =>
+				await this.getRuntimeOrRecordFailure(
+					{
+						agentId,
+						projectId,
+						integrationType,
+						usePublishedVersion: !isDraft,
+						...(isDraft ? { user: identity.user } : {}),
+						sandboxPrincipalHash: identity.principalHash,
+					},
+					{
+						threadId: memory.threadId,
+						userMessage: null,
+						source: integrationType,
+						abortSignal,
+						access,
+						sessionMode: 'existing',
+					},
+				),
+			(runtime) =>
+				this.streamWakeResponse(
+					this.streamChatResponse({
+						access,
+						messageContext,
+						agentInstance: runtime.agent,
+						toolRegistry: runtime.toolRegistry,
+						mcpServerAttributions: runtime.mcpServerAttributions,
+						agentId,
+						...(isDraft ? { userId: identity.user.id } : {}),
+						message,
+						memory,
+						projectId: runtime.projectId,
+						source: integrationType,
+						telemetry: {
+							runType: isDraft ? 'test' : 'production',
+							configuration: runtime.telemetryConfiguration,
+						},
+						abortSignal,
+						includeHitlToolDetails: isDraft,
+						sandboxPrincipalHash: identity.principalHash,
+						hideUserMessageFromTranscript: true,
+						isWakeRun: true,
+						sessionMode: 'existing',
+						backgroundJobSignal: config.backgroundJobSignal,
+					}),
+					abortSignal,
+					delivery,
+				),
+		);
+		for await (const _chunk of stream) {
+			// Complete execution and reply delivery within the runtime lease.
+		}
+	}
+
+	private async *streamWakeResponse(
+		stream: AsyncGenerator<StreamChunk>,
+		abortSignal: AbortSignal,
+		delivery?: { bridge: AgentChatBridge; threadId: string },
+	): AsyncGenerator<StreamChunk> {
+		const chunks: StreamChunk[] = [];
+		let runError: unknown;
+		for await (const chunk of stream) {
+			if (delivery) chunks.push(chunk);
+			if (chunk.type === 'error') runError = chunk.error;
+			if (chunk.type === 'finish' && chunk.finishReason === 'error') runError ??= chunk;
+			yield chunk;
+		}
+		// Leave failed job results pending so the caller can retry delivery.
+		if (runError !== undefined) {
+			throw new OperationalError('Background job wake failed', { cause: runError });
+		}
+		abortSignal.throwIfAborted();
+		if (delivery) await delivery.bridge.deliverWakeResponse(delivery.threadId, chunks);
+	}
+
+	private async getWakeDelivery(
+		agentId: string,
+		integrationType: string,
+		context: IntegrationMessageContext | null,
+	) {
+		const target = context?.replyTarget ?? context?.target;
+		const [platform, credentialId] = context?.integrationConnectionId.split(':') ?? [];
+		if (
+			context?.platform !== integrationType ||
+			platform !== integrationType ||
+			!credentialId ||
+			!target?.threadId
+		) {
+			throw new OperationalError('Background job wake has no reply context');
+		}
+
+		// Use the stored connection so results return to the correct workspace.
+		const { ChatIntegrationService } = await import('./integrations/chat-integration.service.js');
+		const bridge = Container.get(ChatIntegrationService).getBridge(
+			agentId,
+			integrationType,
+			credentialId,
+		);
+		if (!bridge) {
+			throw new OperationalError('Background job wake chat connection is unavailable');
+		}
+		return { bridge, threadId: target.threadId };
 	}
 
 	/**
@@ -600,9 +1006,12 @@ export class AgentExecutionOrchestratorService {
 		const {
 			agentInstance,
 			toolRegistry,
+			mcpServerAttributions,
 			agentId,
 			userId,
 			message,
+			modelMessage = message,
+			author,
 			attachments,
 			memory,
 			projectId,
@@ -612,153 +1021,162 @@ export class AgentExecutionOrchestratorService {
 			telemetry,
 			onExecutionRecorded,
 			abortSignal,
+			includeHitlToolDetails,
+			sandboxPrincipalHash,
+			hideUserMessageFromTranscript,
+			isWakeRun,
+			backgroundJobSignal,
+			sessionMode,
 		} = config;
 		const { threadId, resourceId } = memory;
 
-		let executionId: string | undefined;
-		const recorder = this.createRecorder(toolRegistry, () => executionId, {
-			projectId,
-			agentId,
-			threadId,
-		});
-		const startedAt = recorder.startedAt;
-
-		try {
-			const tracing = await this.agentRunTracingService.build({
-				agentId,
-				projectId,
-				threadId,
-				userId,
-				source: source ?? 'test',
-				modelId: modelIdFromSnapshot(agentInstance.snapshot.model),
-			});
-
-			const input = attachments?.length ? buildInboundUserMessage(message, attachments) : message;
-			const resultStream = await agentInstance.stream(input, {
-				persistence: { threadId, resourceId },
-				executionCounter: createAgentExecutionCounter(this.telemetry, {
+		yield* this.turnExecutionService.execute({
+			agentInstance,
+			toolRegistry,
+			mcpServerAttributions,
+			context: { projectId, agentId, threadId },
+			backgroundJobSignal,
+			includeHitlToolDetails,
+			onExecutionRecorded,
+			onSettled: isWakeRun
+				? undefined
+				: async () => await this.requestPendingBackgroundWake(threadId),
+			prepare: async () => {
+				const tracing = await this.agentRunTracingService.build({
 					agentId,
-					userId,
-					runType: telemetry.runType,
-				}),
-				...(tracing ? { telemetry: tracing } : {}),
-				...(abortSignal ? { abortSignal } : {}),
-			});
-			const startParams: StartExecutionParams = {
-				threadId,
-				agentId,
-				agentName: agentInstance.name,
-				projectId,
-				userMessage: message,
-				attachments,
-				source,
-				taskId,
-				taskVersionId,
-				telemetry,
-			};
-			executionId = await this.tryStartExecution(
-				startParams,
-				startedAt,
-				'Failed to start agent execution recording',
-			);
-			for await (const value of streamAgentChunks(resultStream.stream)) {
-				recorder.record(value);
-				if (value.type === 'tool-call-suspended') {
-					this.logger.info('Chat: tool-call-suspended chunk received', {
-						agentId,
-						toolCallId: value.toolCallId,
-						toolName: value.toolName,
-					});
-				}
-				if (value.type === 'finish' && value.finishReason === 'max-iterations') {
-					for (const chunk of getMaxIterationsChunks()) {
-						recorder.record(chunk);
-						yield chunk;
-					}
-				}
-				yield value;
-			}
-		} catch (error) {
-			recorder.record({ type: 'error', error });
-			recorder.record({ type: 'finish', finishReason: 'error' });
-			throw error;
-		} finally {
-			// Always record — even if suspended or failed, the pre-suspension/error
-			// response text and tool calls are valuable.
-			const messageRecord = normalizeAbortedMessageRecord(recorder.getMessageRecord(), abortSignal);
-			await this.persistRecordedExecution({
-				executionId,
-				onExecutionRecorded,
-				failureMessage: 'Failed to record agent execution',
-				params: {
-					threadId,
-					agentId,
-					agentName: agentInstance.name,
 					projectId,
-					userMessage: message,
-					attachments,
-					record: messageRecord,
-					hitlStatus: recorder.suspended ? 'suspended' : undefined,
-					source,
-					taskId,
-					taskVersionId,
-					telemetry,
-				},
-			});
-		}
-	}
-
-	private createRecorder(
-		toolRegistry: ToolRegistry,
-		getExecutionId: () => string | undefined,
-		context: Pick<StartExecutionParams, 'projectId' | 'agentId' | 'threadId'>,
-	): ExecutionRecorder {
-		return new ExecutionRecorder(toolRegistry, (timeline) => {
-			const executionId = getExecutionId();
-			if (executionId) {
-				this.agentExecutionService.recordTimelineSnapshot({
-					...context,
-					executionId,
-					timeline,
+					threadId,
+					userId,
+					source: source ?? 'test',
+					modelId: modelIdFromSnapshot(agentInstance.snapshot.model),
 				});
-			}
+				const input = attachments?.length
+					? buildInboundUserMessage(modelMessage, attachments)
+					: modelMessage;
+				const messageContext =
+					config.messageContext === undefined
+						? await this.integrationMessageContextService.getLatest(threadId)
+						: config.messageContext;
+				const hostMetadata = {
+					...encodeAgentSandboxHostMetadata({
+						projectId,
+						principalHash: sandboxPrincipalHash,
+					}),
+					...encodeIntegrationMessageContext(messageContext),
+				};
+
+				return {
+					type: 'start',
+					input,
+					options: {
+						persistence: { threadId, resourceId, hostMetadata },
+						executionCounter: createAgentExecutionCounter(this.telemetry, {
+							agentId,
+							userId,
+							runType: telemetry.runType,
+						}),
+						...modelStreamStallOptions(this.aiConfig),
+						...(tracing ? { telemetry: tracing } : {}),
+						...(abortSignal ? { abortSignal } : {}),
+					},
+					recording: {
+						threadId,
+						access: config.access,
+						agentId,
+						agentName: agentInstance.name,
+						projectId,
+						userMessage: hideUserMessageFromTranscript ? null : message,
+						sessionMode,
+						author,
+						attachments,
+						source,
+						taskId,
+						taskVersionId,
+						telemetry: { ...telemetry, userId },
+					},
+				};
+			},
 		});
 	}
 
-	private async tryStartExecution(
-		params: StartExecutionParams,
-		startedAt: Date,
-		failureMessage: string,
-	): Promise<string | undefined> {
+	private async *withRuntimeLease(
+		acquire: () => Promise<AgentRuntime>,
+		use: (
+			runtime: AgentRuntime,
+		) => AsyncGenerator<StreamChunk> | Promise<AsyncGenerator<StreamChunk>>,
+	): AsyncGenerator<StreamChunk> {
+		const runtime = await acquire();
 		try {
-			return await this.agentExecutionService.startExecutionRecording(params, startedAt);
-		} catch (error) {
-			this.logger.warn(failureMessage, {
-				agentId: params.agentId,
-				threadId: params.threadId,
-				error: error instanceof Error ? error.message : String(error),
-			});
-			return undefined;
+			yield* await use(runtime);
+		} finally {
+			this.runtimeCacheService.releaseRuntimeLease(runtime.agent);
 		}
 	}
 
-	private async persistRecordedExecution(args: {
-		executionId?: string;
-		onExecutionRecorded?: (executionId: string) => void;
-		params: RecordMessageParams;
-		failureMessage: string;
-	}): Promise<void> {
-		const { executionId, onExecutionRecorded, params, failureMessage } = args;
-		if (!executionId) return;
+	private async requestPendingBackgroundWake(threadId: string): Promise<void> {
 		try {
-			const recordedId = await this.agentExecutionService.finalizeExecution(executionId, params);
-			onExecutionRecorded?.(recordedId);
+			const { AgentWakeService } = await import('./background/agent-wake.service.js');
+			await Container.get(AgentWakeService).onParentTurnFinished(threadId);
 		} catch (error) {
-			this.logger.warn(failureMessage, {
-				agentId: params.agentId,
-				threadId: params.threadId,
-				error: error instanceof Error ? error.message : String(error),
-			});
+			this.logger.warn('Failed to request pending background job delivery', { threadId, error });
+		}
+	}
+
+	/** Record runtime initialization failures before reporting them to the caller. */
+	private async getRuntimeOrRecordFailure(
+		params: GetRuntimeParams,
+		session: Pick<
+			StartExecutionParams,
+			| 'threadId'
+			| 'userMessage'
+			| 'author'
+			| 'attachments'
+			| 'source'
+			| 'taskId'
+			| 'taskVersionId'
+			| 'access'
+			| 'sessionMode'
+		> & {
+			onExecutionRecorded?: (executionId: string) => void;
+			abortSignal?: AbortSignal;
+		},
+	): Promise<AgentRuntime> {
+		const { onExecutionRecorded, abortSignal, ...recording } = session;
+		abortSignal?.throwIfAborted();
+		try {
+			return await this.runtimeCacheService.getRuntime(params);
+		} catch (error) {
+			abortSignal?.throwIfAborted();
+			const { agentId, projectId } = params;
+			let agent;
+			try {
+				agent = await this.agentRepository.findByIdAndProjectId(agentId, projectId);
+			} catch (cause) {
+				throw new AgentExecutionRecordingError({ phase: 'create', cause, executionError: error });
+			}
+			abortSignal?.throwIfAborted();
+			if (agent) {
+				const selected =
+					params.usePublishedVersion && agent.activeVersion?.schema
+						? getPublishedAgentSnapshot(agent)
+						: agent;
+				await this.turnExecutionService.recordFailedStart(
+					{
+						...recording,
+						agentId,
+						agentName: selected.schema?.name ?? agent.name,
+						projectId,
+						telemetry: {
+							userId: params.user?.id,
+							runType: params.usePublishedVersion ? 'production' : 'test',
+							configuration: buildAgentConfigurationTelemetry(selected),
+						},
+					},
+					error,
+					onExecutionRecorded,
+				);
+			}
+			throw error;
 		}
 	}
 }

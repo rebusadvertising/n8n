@@ -71,6 +71,10 @@ export interface IntegrationMessageSubject {
 	description?: string;
 	url?: string;
 	status?: string;
+	/** The project the subject belongs to, when the platform reports one. */
+	projectId?: string;
+	/** The team the subject belongs to, when the platform reports one. */
+	teamId?: string;
 	labels?: string[];
 	assignee?: IntegrationSubjectPerson;
 	author?: IntegrationSubjectPerson;
@@ -82,9 +86,8 @@ export interface IntegrationSubjectPerson {
 }
 
 /**
- * Source of a tool connection: a persisted credential integration, or the
- * implicit credential-less in-app chat channel (injected per-run, never
- * stored on the agent).
+ * Source of a tool connection: a configured integration, or the implicit
+ * preview chat channel injected per run.
  */
 export type IntegrationToolConnectionSource =
 	| AgentIntegrationConfig
@@ -170,25 +173,30 @@ export interface SessionBinding {
 	resourceId: string;
 }
 
+export interface IntegrationContextQueryParams {
+	abortSignal?: AbortSignal;
+	descriptor: IntegrationToolConnectionDescriptor;
+	query: IntegrationContextQuery;
+	input: Record<string, unknown>;
+	persistence?: { threadId: string; resourceId: string };
+}
+
 export interface IntegrationContextQueryExecutor {
-	execute(params: {
-		descriptor: IntegrationToolConnectionDescriptor;
-		query: IntegrationContextQuery;
-		input: Record<string, unknown>;
-		persistence?: { threadId: string; resourceId: string };
-	}): Promise<unknown>;
+	execute(params: IntegrationContextQueryParams): Promise<unknown>;
+}
+
+export interface IntegrationActionParams {
+	descriptor: IntegrationToolConnectionDescriptor;
+	action: IntegrationAction;
+	input: Record<string, unknown>;
+	awaitResponse: boolean;
+	runId?: string;
+	toolCallId?: string;
+	currentMessageContext?: IntegrationMessageContext;
 }
 
 export interface IntegrationActionExecutor {
-	execute(params: {
-		descriptor: IntegrationToolConnectionDescriptor;
-		action: IntegrationAction;
-		input: Record<string, unknown>;
-		awaitResponse: boolean;
-		runId?: string;
-		toolCallId?: string;
-		currentMessageContext?: IntegrationMessageContext;
-	}): Promise<IntegrationActionResult>;
+	execute(params: IntegrationActionParams): Promise<IntegrationActionResult>;
 }
 
 export type IntegrationActionResult =
